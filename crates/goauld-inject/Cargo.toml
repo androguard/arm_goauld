@@ -1,0 +1,19 @@
+[package]
+name = "goauld-inject"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "goauld host-side ptrace injector and process discovery"
+
+[dependencies]
+goauld-proto = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+libc = { workspace = true }
+nix = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# ptrace injection is Linux/Android-only; macOS host builds get discovery stubs.

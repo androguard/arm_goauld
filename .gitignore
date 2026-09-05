@@ -12,10 +12,14 @@ target
 libs/
 obj/
 *.apk
+*.apk.idsig
+*.keystore
 local.properties
 .cxx/
 dist/
 
+# Demo APK build outputs (sources under testapps/ stay tracked)
+testapps/**/build/
 
 # IDE
 .idea/

@@ -1,0 +1,4 @@
+NDK_VERSION=28.2.13676358
+API_LEVEL=26
+TARGET_TRIPLE=aarch64-linux-android
+# ./scripts/build-android.sh

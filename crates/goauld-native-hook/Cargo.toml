@@ -1,0 +1,17 @@
+[package]
+name = "goauld-native-hook"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "goauld arm64 inline + GOT/PLT hooking engine"
+
+[dependencies]
+arm_disassembler = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+log = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]

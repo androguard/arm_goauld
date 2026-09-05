@@ -1,0 +1,20 @@
+[package]
+name = "goauld-injector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "On-device arm64 Android binary: ptrace-inject libgoauld_agent.so into any process"
+
+[[bin]]
+name = "goauld-injector"
+path = "src/main.rs"
+
+[dependencies]
+goauld-inject = { workspace = true }
+goauld-proto = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

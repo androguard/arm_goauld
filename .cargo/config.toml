@@ -1,0 +1,9 @@
+# Host builds use the default toolchain.
+#
+# On-device aarch64-linux-android builds: set ANDROID_NDK_HOME then use
+# scripts/build-android.sh (writes linker path into this file dynamically),
+# or export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER yourself.
+
+[env]
+# Hint for tools that look for the NDK
+# ANDROID_NDK_HOME = { value = "...", force = false }

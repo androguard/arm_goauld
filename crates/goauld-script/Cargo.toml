@@ -1,0 +1,23 @@
+[package]
+name = "goauld-script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "goauld QuickJS embedding + Frida-shaped JS API"
+
+[features]
+default = ["quickjs"]
+quickjs = ["dep:rquickjs"]
+
+[dependencies]
+goauld-proto = { workspace = true }
+goauld-native-hook = { workspace = true }
+goauld-art-bridge = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+rquickjs = { workspace = true, optional = true }

@@ -1,0 +1,29 @@
+[package]
+name = "goauld-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "goauld agent cdylib — ties hook engines + script + transport"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["quickjs"]
+quickjs = ["goauld-script/quickjs"]
+
+[dependencies]
+goauld-proto = { workspace = true }
+goauld-native-hook = { workspace = true }
+goauld-art-bridge = { workspace = true }
+goauld-script = { workspace = true }
+ctor = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+libc = { workspace = true }
+jni = { workspace = true }
