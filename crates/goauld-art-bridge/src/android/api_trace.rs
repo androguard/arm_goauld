@@ -286,6 +286,7 @@ fn ensure_invoke_hook() -> Result<u32, ArtError> {
                 })),
                 on_leave: None,
                 save_simd: false,
+                replace_mode: false,
             },
         ) {
             Ok(hook) => {

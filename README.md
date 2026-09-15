@@ -227,14 +227,34 @@ cargo run -p goauld-host --release -- attach \
 
 Broader `Java.*` smoke: `scripts/fixtures/java_api.js` (`--expect-send java-api-ok`).
 
-### Native Interceptor (e.g. `strlen`)
+### Native Interceptor
 
 ```bash
+# attach onEnter (classic)
 cargo run -p goauld-host --release -- attach \
   --pid "$(adb shell pidof -s com.example.javatarget | tr -d '\r')" \
   --port 27046 \
   --script scripts/fixtures/interceptor_strlen.js \
   --expect-send interceptor-installed --max-wait-secs 10
+
+# onEnter + onLeave
+--script scripts/fixtures/interceptor_attach.js --expect-send interceptor-attach-ok
+
+# replace + flush + detachAll
+--script scripts/fixtures/interceptor_replace.js --expect-send interceptor-replace-ok
+
+# combined API smoke
+--script scripts/fixtures/interceptor_api.js --expect-send interceptor-api-ok
+```
+
+### Java.perform / performNow
+
+```bash
+cargo run -p goauld-host --release -- attach \
+  --pid "$(adb shell pidof -s com.example.javatarget | tr -d '\r')" \
+  --port 27046 \
+  --script scripts/fixtures/java_perform.js \
+  --expect-send java-perform-ok --max-wait-secs 15
 ```
 
 ### Hello / Process·Module·Memory smoke
@@ -263,9 +283,20 @@ cargo run -p goauld-host --release -- attach \
 | `java_toast.js` | Framework toast on main thread | `toast-shown` |
 | `java_hook.js` | Hook `Target.hookMe` | `java-hook-installed` |
 | `java_api.js` | Frida `Java.*` surface smoke | `java-api-ok` |
+| `java_perform.js` | `Java.perform` / `performNow` | `java-perform-ok` |
+| `thread_api.js` | observers / `runOnThread` / exception handler | `thread-api-ok` |
+| `thread_backtrace.js` | `Thread.backtrace` / `Backtracer` | `backtrace-ok` |
+| `memory_scan.js` | `Memory.scan` / `scanSync` | `memory-scan-ok` |
+| `memory_patch.js` | `Memory.patchCode` | `memory-patch-ok` |
+| `memory_access.js` | `MemoryAccessMonitor` | `memory-access-ok` |
+| `module_enumerate.js` | Module exports/imports/symbols/sections/deps | `module-enum-ok` |
+| `misc_apis.js` | console / hexdump / timers / gc / Cloak / Profiler | `misc-apis-ok` |
 | `inspect_package.js` | Classes / fields / prefs / storage | `inspect-ok` |
 | `trace_java_api.js` | Android API invoke tracing | (via `trace java`) |
-| `interceptor_strlen.js` | Native `Interceptor.attach` | `interceptor-installed` |
+| `interceptor_strlen.js` | Native `Interceptor.attach` (enter) | `interceptor-installed` |
+| `interceptor_attach.js` | `attach` + `onLeave` | `interceptor-attach-ok` |
+| `interceptor_replace.js` | `replace` + `flush` + `detachAll` | `interceptor-replace-ok` |
+| `interceptor_api.js` | attach/leave/replace/flush/detach | `interceptor-api-ok` |
 | `process_module_memory.js` | Process / Module / Memory | `ptmm-ok` |
 | `stress_send.js` / `stress_frida_comm.js` | Comm stress | (via `stress`) |
 

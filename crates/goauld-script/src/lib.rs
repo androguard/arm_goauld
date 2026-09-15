@@ -10,7 +10,10 @@
 mod engine;
 mod js_lock;
 pub mod api;
+pub mod cloak;
 pub mod js_queue;
+pub mod memory_access;
+pub mod timers;
 
 #[cfg(feature = "quickjs")]
 pub mod bindings;

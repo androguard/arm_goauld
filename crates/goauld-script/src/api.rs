@@ -100,6 +100,30 @@ pub mod memory {
         NativePointer(p as u64)
     }
 
+    /// Page-aligned anonymous mapping (preferred for `MemoryAccessMonitor` targets).
+    pub fn alloc_anonymous(size: usize) -> NativePointer {
+        let ps = page_size() as usize;
+        let size = size.max(ps);
+        let size = (size + ps - 1) & !(ps - 1);
+        #[cfg(unix)]
+        {
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if p != libc::MAP_FAILED {
+                return NativePointer(p as u64);
+            }
+        }
+        alloc(size)
+    }
+
     pub fn alloc_utf8_string(s: &str) -> NativePointer {
         let mut bytes = s.as_bytes().to_vec();
         bytes.push(0);
@@ -169,15 +193,17 @@ pub mod memory {
         }
     }
 
-    /// Sync pattern scan: pattern like `"13 37 ?? ff"` (spaces optional).
     pub fn scan_sync(address: NativePointer, size: usize, pattern: &str) -> Vec<(u64, usize)> {
         let needle = parse_scan_pattern(pattern);
         if needle.is_empty() || size < needle.len() {
             return Vec::new();
         }
-        let hay = unsafe { std::slice::from_raw_parts(address.0 as *const u8, size) };
+        let addr = address.0 & 0x00FF_FFFF_FFFF_FFFF;
+        let hay = unsafe { std::slice::from_raw_parts(addr as *const u8, size) };
         let mut out = Vec::new();
         let nlen = needle.len();
+        // Cap hits so a broad pattern cannot blow memory.
+        const MAX_HITS: usize = 4096;
         for i in 0..=(hay.len() - nlen) {
             let mut ok = true;
             for (j, (byte, mask)) in needle.iter().enumerate() {
@@ -187,7 +213,10 @@ pub mod memory {
                 }
             }
             if ok {
-                out.push((address.0 + i as u64, nlen));
+                out.push((addr + i as u64, nlen));
+                if out.len() >= MAX_HITS {
+                    break;
+                }
             }
         }
         out
@@ -195,8 +224,29 @@ pub mod memory {
 
     fn parse_scan_pattern(pattern: &str) -> Vec<(u8, u8)> {
         // Optional `: mask` suffix ignored for now except full-byte masks via `??`.
-        let main = pattern.split(':').next().unwrap_or(pattern);
+        // Also accept continuous hex like "41424344" or mixed "41 42??44".
+        let main = pattern.split(':').next().unwrap_or(pattern).trim();
         let mut out = Vec::new();
+        if main.is_empty() {
+            return out;
+        }
+        // If there is no whitespace and length is even hex-ish, treat as packed bytes.
+        let has_space = main.chars().any(|c| c.is_whitespace());
+        if !has_space && main.len() >= 2 && main.len() % 2 == 0 && !main.contains('?') {
+            let mut i = 0;
+            while i + 2 <= main.len() {
+                if let Ok(b) = u8::from_str_radix(&main[i..i + 2], 16) {
+                    out.push((b, 0xff));
+                } else {
+                    out.clear();
+                    break;
+                }
+                i += 2;
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
         for tok in main.split_whitespace() {
             if tok == "??" || tok == "?" {
                 out.push((0, 0));
@@ -212,6 +262,45 @@ pub mod memory {
                 out.push((hi, 0xf0));
                 continue;
             }
+            // "41??" style inside a token — expand nibble wildcards pairwise.
+            if tok.len() > 2 && tok.len() % 2 == 0 {
+                let bytes = tok.as_bytes();
+                let mut ok = true;
+                let mut local = Vec::new();
+                let mut i = 0;
+                while i + 2 <= bytes.len() {
+                    let a = bytes[i] as char;
+                    let b = bytes[i + 1] as char;
+                    let pair: String = [a, b].iter().collect();
+                    if pair == "??" {
+                        local.push((0, 0));
+                    } else if a == '?' {
+                        if let Ok(lo) = u8::from_str_radix(&pair[1..], 16) {
+                            local.push((lo, 0x0f));
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    } else if b == '?' {
+                        if let Ok(hi) = u8::from_str_radix(&pair[..1], 16) {
+                            local.push((hi << 4, 0xf0));
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    } else if let Ok(v) = u8::from_str_radix(&pair, 16) {
+                        local.push((v, 0xff));
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                    i += 2;
+                }
+                if ok {
+                    out.extend(local);
+                    continue;
+                }
+            }
             if let Ok(b) = u8::from_str_radix(tok, 16) {
                 out.push((b, 0xff));
             }
@@ -219,9 +308,23 @@ pub mod memory {
         out
     }
 
-    #[allow(dead_code)]
     pub fn maps_readable() -> bool {
         fs::metadata("/proc/self/maps").is_ok()
+    }
+
+    #[cfg(test)]
+    mod scan_tests {
+        use super::*;
+
+        #[test]
+        fn packed_and_wildcard_patterns() {
+            let buf = [0x47u8, 0x4f, 0x41, 0x55, 0xaa, 0x4c];
+            let p = NativePointer(buf.as_ptr() as u64);
+            let hits = scan_sync(p, buf.len(), "474f4155");
+            assert_eq!(hits.len(), 1);
+            let hits2 = scan_sync(p, buf.len(), "47 4f ?? 55");
+            assert_eq!(hits2.len(), 1);
+        }
     }
 }
 
@@ -342,8 +445,11 @@ pub mod process {
 pub mod thread {
     use super::module;
     use super::NativePointer;
+    use parking_lot::Mutex;
     use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[derive(Debug, Clone)]
@@ -367,6 +473,9 @@ pub mod thread {
         for ent in rd.flatten() {
             let tid: u64 = ent.file_name().to_string_lossy().parse().unwrap_or(0);
             if tid == 0 {
+                continue;
+            }
+            if crate::cloak::has_thread(tid) {
                 continue;
             }
             let name = fs::read_to_string(ent.path().join("comm"))
@@ -403,9 +512,149 @@ pub mod thread {
             Vec::new()
         };
         if frames.len() < 2 {
-            frames = backtrace_fuzzy(max_frames);
+            let fuzzy = backtrace_fuzzy(max_frames);
+            if frames.is_empty() {
+                frames = fuzzy;
+            } else {
+                // Fill remaining slots from fuzzy without dupes.
+                let mut seen: std::collections::HashSet<u64> =
+                    frames.iter().map(|p| p.0).collect();
+                for p in fuzzy {
+                    if seen.insert(p.0) {
+                        frames.push(p);
+                        if frames.len() >= max_frames {
+                            break;
+                        }
+                    }
+                }
+            }
         }
         frames
+    }
+
+    /// Snapshot of live threads keyed by tid (for observers).
+    pub fn thread_map() -> std::collections::HashMap<u64, ThreadInfo> {
+        enumerate_threads()
+            .into_iter()
+            .map(|t| (t.id, t))
+            .collect()
+    }
+
+    // --- Thread observer (poll /proc/self/task) ---
+
+    #[derive(Clone)]
+    struct ObserverState {
+        stop: Arc<AtomicBool>,
+    }
+
+    static OBSERVER: Mutex<Option<ObserverState>> = Mutex::new(None);
+
+    /// Start polling for thread add/remove/rename. Events are delivered as JSON
+    /// lines via `on_event(json)` from a background thread (caller should post to JS).
+    pub fn start_thread_observer(on_event: impl Fn(String) + Send + Sync + 'static) {
+        stop_thread_observer();
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            *OBSERVER.lock() = Some(ObserverState {
+                stop: stop.clone(),
+            });
+        }
+        let on_event = Arc::new(on_event);
+        std::thread::Builder::new()
+            .name("goauld-thread-obs".into())
+            .spawn(move || {
+                let mut prev = thread_map();
+                // Emit initial snapshot as onAdded for each existing thread? Frida does
+                // not; only subsequent changes. Keep prev seeded.
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let now = thread_map();
+                    for (id, t) in &now {
+                        if let Some(old) = prev.get(id) {
+                            let old_name = old.name.clone().unwrap_or_default();
+                            let new_name = t.name.clone().unwrap_or_default();
+                            if old_name != new_name {
+                                let json = serde_json::json!({
+                                    "kind": "renamed",
+                                    "id": t.id,
+                                    "name": t.name,
+                                    "state": t.state,
+                                    "previousName": old.name,
+                                })
+                                .to_string();
+                                on_event(json);
+                            }
+                        } else {
+                            let json = serde_json::json!({
+                                "kind": "added",
+                                "id": t.id,
+                                "name": t.name,
+                                "state": t.state,
+                            })
+                            .to_string();
+                            on_event(json);
+                        }
+                    }
+                    for (id, t) in &prev {
+                        if !now.contains_key(id) {
+                            let json = serde_json::json!({
+                                "kind": "removed",
+                                "id": t.id,
+                                "name": t.name,
+                                "state": t.state,
+                            })
+                            .to_string();
+                            on_event(json);
+                        }
+                    }
+                    prev = now;
+                }
+            })
+            .ok();
+    }
+
+    pub fn stop_thread_observer() {
+        if let Some(st) = OBSERVER.lock().take() {
+            st.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    // --- Exception handler (Frida-shaped; probe synthesizes a recoverable fault) ---
+
+    #[derive(Debug, Clone)]
+    pub struct ExceptionDetails {
+        pub type_name: String,
+        pub address: u64,
+        pub memory_operation: Option<String>,
+        pub memory_address: Option<u64>,
+    }
+
+    static EXCEPTION_HANDLER_ON: AtomicBool = AtomicBool::new(false);
+
+    pub fn set_exception_handler_enabled(on: bool) {
+        EXCEPTION_HANDLER_ON.store(on, Ordering::SeqCst);
+    }
+
+    pub fn exception_handler_enabled() -> bool {
+        EXCEPTION_HANDLER_ON.load(Ordering::SeqCst)
+    }
+
+    /// Synthesize a recoverable access-violation for tests / handler smoke.
+    /// Real signal interception is not fully wired (would need async-signal-safe
+    /// recovery); this exercises the JS `Process.setExceptionHandler` path.
+    pub fn exception_probe_details() -> Option<ExceptionDetails> {
+        if !EXCEPTION_HANDLER_ON.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(ExceptionDetails {
+            type_name: "access-violation".into(),
+            address: 0x8,
+            memory_operation: Some("read".into()),
+            memory_address: Some(0x8),
+        })
     }
 
     fn exec_ranges() -> Vec<(u64, u64)> {
@@ -525,6 +774,24 @@ pub mod module {
         pub address: Option<NativePointer>, // GOT/PLT slot when known
         pub slot: Option<NativePointer>,
         pub module: Option<String>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct SymbolInfo {
+        pub name: String,
+        pub address: NativePointer,
+        pub size: u64,
+        pub kind: String, // "function" | "object" | "section" | "undefined" | ...
+        pub is_global: bool,
+        pub is_weak: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct SectionInfo {
+        pub id: u32,
+        pub name: String,
+        pub address: NativePointer,
+        pub size: u64,
     }
 
     pub fn find_base_address(module_name: &str) -> Option<NativePointer> {
@@ -879,6 +1146,263 @@ pub mod module {
         Some(out)
     }
 
+    pub fn enumerate_symbols(module: &ModuleInfo) -> Vec<SymbolInfo> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            enumerate_symbols_elf_file(module).unwrap_or_default()
+        })) {
+            Ok(v) => v,
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn enumerate_sections(module: &ModuleInfo) -> Vec<SectionInfo> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            enumerate_sections_elf_file(module).unwrap_or_default()
+        })) {
+            Ok(v) => v,
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn enumerate_dependencies(module: &ModuleInfo) -> Vec<String> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            enumerate_dependencies_elf_file(module).unwrap_or_default()
+        })) {
+            Ok(v) => v,
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn enumerate_symbols_elf_file(module: &ModuleInfo) -> Option<Vec<SymbolInfo>> {
+        let bytes = fs::read(&module.path).ok()?;
+        if bytes.len() < 64 || bytes[0..4] != [0x7f, b'E', b'L', b'F'] || bytes[4] != 2 {
+            return None;
+        }
+        let e_shoff = u64_at(&bytes, 40)? as usize;
+        let e_shentsize = u16_at(&bytes, 58)? as usize;
+        let e_shnum = u16_at(&bytes, 60)? as usize;
+        let e_shstrndx = u16_at(&bytes, 62)? as usize;
+        if e_shoff == 0 || e_shnum == 0 || e_shentsize < 64 {
+            // Fall back to dynsym-only via exports-shaped walk.
+            return symbols_from_dynsym(module, &bytes);
+        }
+        let shstr_off = {
+            let sh = e_shoff + e_shstrndx * e_shentsize;
+            u64_at(&bytes, sh + 24)? as usize
+        };
+        let mut load_bias = module.base;
+        let e_phoff = u64_at(&bytes, 32)? as usize;
+        let e_phentsize = u16_at(&bytes, 54)? as usize;
+        let e_phnum = u16_at(&bytes, 56)? as usize;
+        for i in 0..e_phnum {
+            let ph = e_phoff + i * e_phentsize;
+            if u32_at(&bytes, ph)? == 1 {
+                load_bias = module.base.wrapping_sub(u64_at(&bytes, ph + 16)?);
+                break;
+            }
+        }
+
+        // Prefer .symtab (full); else .dynsym.
+        let mut symtab: Option<(usize, usize, usize, usize)> = None; // sym_off, sym_size, str_off, entsize
+        let mut dynsym: Option<(usize, usize, usize, usize)> = None;
+        for i in 0..e_shnum {
+            let sh = e_shoff + i * e_shentsize;
+            let name_off = u32_at(&bytes, sh)? as usize;
+            let sh_type = u32_at(&bytes, sh + 4)?;
+            let sh_offset = u64_at(&bytes, sh + 24)? as usize;
+            let sh_size = u64_at(&bytes, sh + 32)? as usize;
+            let sh_link = u32_at(&bytes, sh + 40)? as usize;
+            let sh_entsize = u64_at(&bytes, sh + 56).unwrap_or(24) as usize;
+            let name = cstr_at(&bytes, shstr_off + name_off).unwrap_or_default();
+            if sh_type == 2 || sh_type == 11 {
+                // SHT_SYMTAB=2, SHT_DYNSYM=11
+                let str_sh = e_shoff + sh_link * e_shentsize;
+                let str_off = u64_at(&bytes, str_sh + 24)? as usize;
+                let entry = (sh_offset, sh_size, str_off, sh_entsize.max(24));
+                if name == ".symtab" || sh_type == 2 {
+                    symtab = Some(entry);
+                } else if name == ".dynsym" || sh_type == 11 {
+                    dynsym = Some(entry);
+                }
+            }
+        }
+        let (sym_off, sym_size, str_off, entsize) = symtab.or(dynsym)?;
+        let nsyms = sym_size / entsize;
+        if nsyms == 0 || nsyms > 500_000 {
+            return None;
+        }
+        let mut out = Vec::new();
+        for i in 0..nsyms {
+            let sym = sym_off + i * entsize;
+            if sym + entsize > bytes.len() {
+                break;
+            }
+            let st_name = u32_at(&bytes, sym)? as usize;
+            let st_info = bytes.get(sym + 4).copied()?;
+            let st_shndx = u16_at(&bytes, sym + 6)?;
+            let st_value = u64_at(&bytes, sym + 8)?;
+            let st_size = u64_at(&bytes, sym + 16).unwrap_or(0);
+            if st_name == 0 {
+                continue;
+            }
+            let name = cstr_at(&bytes, str_off + st_name)?;
+            if name.is_empty() {
+                continue;
+            }
+            let bind = st_info >> 4;
+            let typ = st_info & 0xf;
+            let kind = match typ {
+                0 => {
+                    if st_shndx == 0 {
+                        "undefined"
+                    } else {
+                        "object"
+                    }
+                }
+                1 | 10 => "function",
+                2 => "object",
+                3 => "section",
+                4 => "file",
+                _ => "unknown",
+            };
+            // Skip anonymous section/file clutter unless named meaningfully.
+            if kind == "file" {
+                continue;
+            }
+            out.push(SymbolInfo {
+                name,
+                address: NativePointer(load_bias.wrapping_add(st_value)),
+                size: st_size,
+                kind: kind.into(),
+                is_global: bind == 1,
+                is_weak: bind == 2,
+            });
+        }
+        Some(out)
+    }
+
+    fn symbols_from_dynsym(module: &ModuleInfo, bytes: &[u8]) -> Option<Vec<SymbolInfo>> {
+        // Reuse export enumeration and map kinds.
+        let exports = enumerate_exports_elf_file(module)?;
+        let _ = bytes;
+        Some(
+            exports
+                .into_iter()
+                .map(|e| SymbolInfo {
+                    name: e.name,
+                    address: e.address,
+                    size: 0,
+                    kind: if e.kind == "variable" {
+                        "object".into()
+                    } else {
+                        e.kind
+                    },
+                    is_global: true,
+                    is_weak: false,
+                })
+                .collect(),
+        )
+    }
+
+    fn enumerate_sections_elf_file(module: &ModuleInfo) -> Option<Vec<SectionInfo>> {
+        let bytes = fs::read(&module.path).ok()?;
+        if bytes.len() < 64 || bytes[0..4] != [0x7f, b'E', b'L', b'F'] || bytes[4] != 2 {
+            return None;
+        }
+        let e_shoff = u64_at(&bytes, 40)? as usize;
+        let e_shentsize = u16_at(&bytes, 58)? as usize;
+        let e_shnum = u16_at(&bytes, 60)? as usize;
+        let e_shstrndx = u16_at(&bytes, 62)? as usize;
+        if e_shoff == 0 || e_shnum == 0 || e_shentsize < 64 {
+            return None;
+        }
+        let shstr_off = {
+            let sh = e_shoff + e_shstrndx * e_shentsize;
+            u64_at(&bytes, sh + 24)? as usize
+        };
+        let mut load_bias = module.base;
+        let e_phoff = u64_at(&bytes, 32)? as usize;
+        let e_phentsize = u16_at(&bytes, 54)? as usize;
+        let e_phnum = u16_at(&bytes, 56)? as usize;
+        for i in 0..e_phnum {
+            let ph = e_phoff + i * e_phentsize;
+            if u32_at(&bytes, ph)? == 1 {
+                load_bias = module.base.wrapping_sub(u64_at(&bytes, ph + 16)?);
+                break;
+            }
+        }
+        let mut out = Vec::new();
+        for i in 0..e_shnum {
+            let sh = e_shoff + i * e_shentsize;
+            if sh + e_shentsize > bytes.len() {
+                break;
+            }
+            let name_off = u32_at(&bytes, sh)? as usize;
+            let sh_addr = u64_at(&bytes, sh + 16)?;
+            let sh_size = u64_at(&bytes, sh + 32)?;
+            let name = cstr_at(&bytes, shstr_off + name_off).unwrap_or_default();
+            if name.is_empty() && sh_size == 0 {
+                continue;
+            }
+            out.push(SectionInfo {
+                id: i as u32,
+                name,
+                address: NativePointer(load_bias.wrapping_add(sh_addr)),
+                size: sh_size,
+            });
+        }
+        Some(out)
+    }
+
+    fn enumerate_dependencies_elf_file(module: &ModuleInfo) -> Option<Vec<String>> {
+        let bytes = fs::read(&module.path).ok()?;
+        if bytes.len() < 64 || bytes[0..4] != [0x7f, b'E', b'L', b'F'] || bytes[4] != 2 {
+            return None;
+        }
+        let e_phoff = u64_at(&bytes, 32)? as usize;
+        let e_phentsize = u16_at(&bytes, 54)? as usize;
+        let e_phnum = u16_at(&bytes, 56)? as usize;
+        let mut dyn_off = None;
+        let mut dyn_filesz = 0usize;
+        for i in 0..e_phnum {
+            let ph = e_phoff + i * e_phentsize;
+            let p_type = u32_at(&bytes, ph)?;
+            if p_type == 2 {
+                dyn_off = Some(u64_at(&bytes, ph + 8)? as usize);
+                dyn_filesz = u64_at(&bytes, ph + 32)? as usize;
+            }
+        }
+        let dyn_off = dyn_off?;
+        let mut strtab_va = 0u64;
+        let mut needed_offs: Vec<u64> = Vec::new();
+        let dyn_end = dyn_off.saturating_add(dyn_filesz.min(bytes.len().saturating_sub(dyn_off)));
+        let mut off = dyn_off;
+        while off + 16 <= dyn_end && off + 16 <= bytes.len() {
+            let tag = i64_at(&bytes, off)?;
+            let val = u64_at(&bytes, off + 8)?;
+            match tag {
+                0 => break,
+                5 => strtab_va = val, // DT_STRTAB
+                1 => needed_offs.push(val), // DT_NEEDED
+                _ => {}
+            }
+            off += 16;
+        }
+        if strtab_va == 0 {
+            return None;
+        }
+        let str_file = vaddr_to_offset(&bytes, e_phoff, e_phentsize, e_phnum, strtab_va)?;
+        let mut out = Vec::new();
+        for n in needed_offs {
+            if let Some(name) = cstr_at(&bytes, str_file + n as usize) {
+                if !name.is_empty() {
+                    out.push(name);
+                }
+            }
+        }
+        Some(out)
+    }
+
     fn vaddr_to_offset(
         bytes: &[u8],
         e_phoff: usize,
@@ -995,6 +1519,7 @@ pub mod module {
         let mut ranges: Vec<RangeInfo> = raw_maps()
             .into_iter()
             .filter(|r| prot_matches(&r.protection, protection))
+            .filter(|r| !crate::cloak::range_overlaps_cloaked(r.base, r.size))
             .collect();
         if coalesce {
             ranges = coalesce_ranges(ranges);
@@ -1003,6 +1528,9 @@ pub mod module {
     }
 
     pub fn find_range_by_address(addr: NativePointer) -> Option<RangeInfo> {
+        if crate::cloak::has_range_containing(addr.0) {
+            return None;
+        }
         raw_maps()
             .into_iter()
             .find(|r| addr.0 >= r.base && addr.0 < r.base.saturating_add(r.size))
@@ -1120,6 +1648,7 @@ pub mod interceptor {
                 })),
                 on_leave: None,
                 save_simd: false,
+                replace_mode: false,
             },
         )?;
         live().as_mut().unwrap().insert(target.0, hook.id);

@@ -13,7 +13,7 @@ pub mod trampoline;
 pub mod got;
 
 pub use decoder::{Arm64Decoder, Cond, DecodedInsn, DisasmAdapter, InsnKind};
-pub use patch::{HookError, InlineHook};
+pub use patch::{HookError, InlineHook, attach, detach, detach_all, flush, replace_ptr};
 pub use trampoline::{CpuContext, HookCallbacks, HookEntry, HookId};
 
 /// Minimum patch size for a full-range absolute branch (LDR X17,#8; BR X17; <u64>).

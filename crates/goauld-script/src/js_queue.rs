@@ -47,6 +47,18 @@ pub enum JsJob {
         args_json: String,
         reply: SyncSender<RpcInvokeResult>,
     },
+    /// Native Interceptor onEnter — mutate x0..x7.
+    InterceptorEnter {
+        hook_id: u32,
+        regs: [u64; 8],
+        reply: SyncSender<[u64; 8]>,
+    },
+    /// Native Interceptor onLeave — mutate retval (x0).
+    InterceptorLeave {
+        hook_id: u32,
+        retval: u64,
+        reply: SyncSender<u64>,
+    },
 }
 
 #[derive(Debug)]
@@ -59,6 +71,14 @@ type JobTx = Sender<JsJob>;
 
 static JOB_TX: OnceLock<JobTx> = OnceLock::new();
 
+thread_local! {
+    static IS_JS_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn is_js_worker_thread() -> bool {
+    IS_JS_WORKER.with(|c| c.get())
+}
+
 /// Start the JS worker once. `boot` runs on the worker thread first (create QJS).
 pub fn ensure_started(boot: impl FnOnce() + Send + 'static) {
     let (tx, rx) = mpsc::channel::<JsJob>();
@@ -68,6 +88,7 @@ pub fn ensure_started(boot: impl FnOnce() + Send + 'static) {
     thread::Builder::new()
         .name("goauld-js-worker".into())
         .spawn(move || {
+            IS_JS_WORKER.with(|c| c.set(true));
             boot();
             worker_loop(rx);
         })
@@ -142,6 +163,38 @@ fn worker_loop(rx: Receiver<JsJob>) {
                     let _ = (fn_name, args_json);
                 }
             }
+            JsJob::InterceptorEnter {
+                hook_id,
+                regs,
+                reply,
+            } => {
+                #[cfg(feature = "quickjs")]
+                {
+                    let out = crate::bindings::worker_interceptor_enter(hook_id, regs);
+                    let _ = reply.send(out);
+                }
+                #[cfg(not(feature = "quickjs"))]
+                {
+                    let _ = reply.send(regs);
+                    let _ = hook_id;
+                }
+            }
+            JsJob::InterceptorLeave {
+                hook_id,
+                retval,
+                reply,
+            } => {
+                #[cfg(feature = "quickjs")]
+                {
+                    let out = crate::bindings::worker_interceptor_leave(hook_id, retval);
+                    let _ = reply.send(out);
+                }
+                #[cfg(not(feature = "quickjs"))]
+                {
+                    let _ = reply.send(retval);
+                    let _ = hook_id;
+                }
+            }
         }
     }
 }
@@ -209,6 +262,64 @@ pub fn submit_java_invoke(
 
 pub fn is_started() -> bool {
     JOB_TX.get().is_some()
+}
+
+/// Run Interceptor onEnter on the JS worker; returns possibly-mutated x0..x7.
+pub fn submit_interceptor_enter(hook_id: u32, regs: [u64; 8], timeout: Duration) -> [u64; 8] {
+    if is_js_worker_thread() {
+        #[cfg(feature = "quickjs")]
+        {
+            return crate::bindings::worker_interceptor_enter(hook_id, regs);
+        }
+        #[cfg(not(feature = "quickjs"))]
+        {
+            return regs;
+        }
+    }
+    let Some(tx) = JOB_TX.get() else {
+        return regs;
+    };
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    if tx
+        .send(JsJob::InterceptorEnter {
+            hook_id,
+            regs,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return regs;
+    }
+    reply_rx.recv_timeout(timeout).unwrap_or(regs)
+}
+
+/// Run Interceptor onLeave on the JS worker; returns possibly-mutated retval.
+pub fn submit_interceptor_leave(hook_id: u32, retval: u64, timeout: Duration) -> u64 {
+    if is_js_worker_thread() {
+        #[cfg(feature = "quickjs")]
+        {
+            return crate::bindings::worker_interceptor_leave(hook_id, retval);
+        }
+        #[cfg(not(feature = "quickjs"))]
+        {
+            return retval;
+        }
+    }
+    let Some(tx) = JOB_TX.get() else {
+        return retval;
+    };
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    if tx
+        .send(JsJob::InterceptorLeave {
+            hook_id,
+            retval,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return retval;
+    }
+    reply_rx.recv_timeout(timeout).unwrap_or(retval)
 }
 
 /// Deliver a host post to JS `recv` waiters (fire-and-forget).

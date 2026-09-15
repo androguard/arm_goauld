@@ -42,9 +42,20 @@ Cases:
   inject         inject agent into java-target (--stage-into-app)
   hi             attach + hi.js
   ptmm           Process / Module / Memory fixture
-  interceptor    native Interceptor.attach
+  interceptor    native Interceptor.attach (enter)
+  interceptor-attach  Interceptor.attach onEnter/onLeave
+  interceptor-replace Interceptor.replace + flush
+  interceptor-api     Interceptor attach/replace/flush/detach smoke
+  thread-api     Thread observers / runOnThread / exception handler
+  backtrace      Thread.backtrace / Backtracer
+  memory-scan    Memory.scan / scanSync
+  memory-patch   Memory.patchCode
+  memory-access  MemoryAccessMonitor
+  module-enum    Module.enumerateExports/Imports/Symbols/Sections/deps
+  misc-apis      console / hexdump / timers / gc / Cloak / Profiler
   toast          android.widget.Toast
   java-api       Java.* surface smoke
+  java-perform   Java.perform / performNow
   inspect        package / fields / prefs dump
   java-hook      Technique-A hookMe
   android-api    attach java (ART invoke events)
@@ -132,7 +143,7 @@ ensure_apk() {
       local rc=$?
       set -e
       if [[ $rc -ne 0 ]] && echo "$inst" | grep -qi 'UPDATE_INCOMPATIBLE\|INSTALL_FAILED'; then
-        log "reinstall: uninstalling mismatched $PKG…"
+        log "reinstall: uninstalling mismatched $PKG ..."
         adb uninstall "$PKG" >/dev/null 2>&1 || true
         adb install "$APK" >/dev/null
       elif [[ $rc -ne 0 ]]; then
@@ -141,7 +152,7 @@ ensure_apk() {
       fi
     fi
   else
-    log "installing $APK…"
+    log "installing $APK ..."
     adb install "$APK" >/dev/null
   fi
 }
@@ -306,9 +317,97 @@ case_interceptor() {
   require_injected || return 1
   attach_expect "$FIX/interceptor_strlen.js" "interceptor-installed" 15 \
     || fail "interceptor" || return 1
-  ok "Interceptor.attach"
-  # strlen hooks can destabilize ART — force a clean process for later Java cases.
+  ok "Interceptor.attach (enter)"
+}
+
+case_interceptor_attach() {
+  log "== interceptor_attach.js =="
+  require_injected || return 1
+  attach_expect "$FIX/interceptor_attach.js" "interceptor-attach-ok" 20 \
+    || fail "interceptor-attach" || return 1
+  ok "Interceptor.attach onEnter/onLeave"
+}
+
+case_interceptor_replace() {
+  log "== interceptor_replace.js =="
+  require_injected || return 1
+  attach_expect "$FIX/interceptor_replace.js" "interceptor-replace-ok" 20 \
+    || fail "interceptor-replace" || return 1
+  ok "Interceptor.replace/flush"
   force_stop
+}
+
+case_interceptor_api() {
+  log "== interceptor_api.js =="
+  require_injected || return 1
+  attach_expect "$FIX/interceptor_api.js" "interceptor-api-ok" 20 \
+    || fail "interceptor-api" || return 1
+  ok "Interceptor API smoke"
+  force_stop
+}
+
+case_java_perform() {
+  log "== java_perform.js =="
+  require_injected || return 1
+  attach_expect "$FIX/java_perform.js" "java-perform-ok" 20 \
+    || fail "java-perform" || return 1
+  ok "Java.perform/performNow"
+}
+
+case_thread_api() {
+  log "== thread_api.js =="
+  require_injected || return 1
+  attach_expect "$FIX/thread_api.js" "thread-api-ok" 25 \
+    || fail "thread-api" || return 1
+  ok "Thread observers/runOnThread/exception"
+}
+
+case_backtrace() {
+  log "== thread_backtrace.js =="
+  require_injected || return 1
+  attach_expect "$FIX/thread_backtrace.js" "backtrace-ok" 15 \
+    || fail "backtrace" || return 1
+  ok "Thread.backtrace/Backtracer"
+}
+
+case_memory_scan() {
+  log "== memory_scan.js =="
+  require_injected || return 1
+  attach_expect "$FIX/memory_scan.js" "memory-scan-ok" 15 \
+    || fail "memory-scan" || return 1
+  ok "Memory.scan/scanSync"
+}
+
+case_memory_patch() {
+  log "== memory_patch.js =="
+  require_injected || return 1
+  attach_expect "$FIX/memory_patch.js" "memory-patch-ok" 15 \
+    || fail "memory-patch" || return 1
+  ok "Memory.patchCode"
+}
+
+case_memory_access() {
+  log "== memory_access.js =="
+  require_injected || return 1
+  attach_expect "$FIX/memory_access.js" "memory-access-ok" 20 \
+    || fail "memory-access" || return 1
+  ok "MemoryAccessMonitor"
+}
+
+case_module_enum() {
+  log "== module_enumerate.js =="
+  require_injected || return 1
+  attach_expect "$FIX/module_enumerate.js" "module-enum-ok" 20 \
+    || fail "module-enum" || return 1
+  ok "Module enumerateExports/Imports/Symbols/Sections"
+}
+
+case_misc_apis() {
+  log "== misc_apis.js =="
+  require_injected || return 1
+  attach_expect "$FIX/misc_apis.js" "misc-apis-ok" 20 \
+    || fail "misc-apis" || return 1
+  ok "console/hexdump/timers/gc/Cloak/Profiler"
 }
 
 case_toast() {
@@ -452,8 +551,19 @@ run_case() {
     hi) case_hi ;;
     ptmm) case_ptmm ;;
     interceptor) case_interceptor ;;
+    interceptor-attach) case_interceptor_attach ;;
+    interceptor-replace) case_interceptor_replace ;;
+    interceptor-api) case_interceptor_api ;;
     toast) case_toast ;;
     java-api) case_java_api ;;
+    java-perform) case_java_perform ;;
+    thread-api) case_thread_api ;;
+    backtrace) case_backtrace ;;
+    memory-scan) case_memory_scan ;;
+    memory-patch) case_memory_patch ;;
+    memory-access) case_memory_access ;;
+    module-enum) case_module_enum ;;
+    misc-apis) case_misc_apis ;;
     inspect) case_inspect ;;
     java-hook) case_java_hook ;;
     android-api) case_android_api ;;
@@ -474,11 +584,22 @@ ALL_CASES=(
   ptmm
   toast
   java-api
+  java-perform
+  thread-api
+  backtrace
+  memory-scan
+  memory-patch
+  memory-access
+  module-enum
+  misc-apis
   inspect
   android-api
   android-api-hooks
   java-hook
   interceptor
+  interceptor-attach
+  interceptor-replace
+  interceptor-api
   trace-java
 )
 
