@@ -13,12 +13,13 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["quickjs"]
 quickjs = ["goauld-script/quickjs"]
+symbiote = ["goauld-script/symbiote"]
 
 [dependencies]
 goauld-proto = { workspace = true }
 goauld-native-hook = { workspace = true }
 goauld-art-bridge = { workspace = true }
-goauld-script = { workspace = true }
+goauld-script = { workspace = true, default-features = false }
 ctor = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }

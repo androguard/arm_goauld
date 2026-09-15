@@ -3,7 +3,7 @@
 //! Intended to run **on the Android device** as the `goauld-injector` binary
 //! (root / elevated), not on the desktop host.
 
-use crate::remote::{RemoteCall, Tracee, TraceeError};
+use crate::remote::{Tracee, TraceeError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]

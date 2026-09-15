@@ -31,7 +31,7 @@ goauld-proto = { path = "crates/goauld-proto" }
 goauld-inject = { path = "crates/goauld-inject" }
 goauld-native-hook = { path = "crates/goauld-native-hook" }
 goauld-art-bridge = { path = "crates/goauld-art-bridge" }
-goauld-script = { path = "crates/goauld-script" }
+goauld-script = { path = "crates/goauld-script", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -43,6 +43,8 @@ libc = "0.2"
 arm_disassembler = { path = "../arm_disassembler" }
 ctor = "0.2"
 rquickjs = { version = "0.9", features = ["bindgen", "macro"] }
+symbiote-core = { path = "../../symbiote/symbiote-core", default-features = false }
+symbiote-jit = { path = "../../symbiote/symbiote-jit" }
 jni = "0.21"
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"

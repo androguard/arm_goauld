@@ -386,6 +386,22 @@ case_memory_patch() {
   ok "Memory.patchCode"
 }
 
+case_arm64_writer() {
+  log "== arm64_writer.js =="
+  require_injected || return 1
+  attach_expect "$FIX/arm64_writer.js" "arm64-writer-ok" 15 \
+    || fail "arm64-writer" || return 1
+  ok "Arm64Writer/Relocator/enums"
+}
+
+case_arm64_examples() {
+  log "== arm64_writer_examples.js =="
+  require_injected || return 1
+  attach_expect "$FIX/arm64_writer_examples.js" "arm64-examples-ok" 20 \
+    || fail "arm64-examples" || return 1
+  ok "Arm64Writer real examples"
+}
+
 case_memory_access() {
   log "== memory_access.js =="
   require_injected || return 1
@@ -561,6 +577,8 @@ run_case() {
     backtrace) case_backtrace ;;
     memory-scan) case_memory_scan ;;
     memory-patch) case_memory_patch ;;
+    arm64-writer) case_arm64_writer ;;
+    arm64-examples) case_arm64_examples ;;
     memory-access) case_memory_access ;;
     module-enum) case_module_enum ;;
     misc-apis) case_misc_apis ;;
@@ -589,6 +607,8 @@ ALL_CASES=(
   backtrace
   memory-scan
   memory-patch
+  arm64-writer
+  arm64-examples
   memory-access
   module-enum
   misc-apis

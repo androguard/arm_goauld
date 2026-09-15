@@ -37,7 +37,7 @@ it deploys `goauld-injector` + the agent `.so` and executes the injector as root
 | `goauld-injector` | **On-device** arm64 binary — inject into any process/package |
 | `goauld-native-hook` | Agent: arm64 inline + GOT/PLT hooks |
 | `goauld-art-bridge` | Agent: ArtMethod / JNI hooks |
-| `goauld-script` | Agent: QuickJS + Frida-shaped JS API |
+| `goauld-script` | Agent: Frida-shaped JS API (QuickJS **or** Symbiote) |
 | `goauld-agent` | Agent cdylib (`libgoauld_agent.so`) |
 | `goauld-host` | Desktop CLI (adb orchestrator + script attach) |
 
@@ -50,9 +50,28 @@ Disassembler: path dependency on sibling [`arm_disassembler`](../arm_disassemble
 cargo build -p goauld-host --release
 
 # On-device arm64 artifacts (NDK — pin in ndk.txt)
-./scripts/build-android.sh
+./scripts/build-android.sh              # QuickJS (default)
+./scripts/build-android.sh symbiote     # Symbiote (path dep: ../../symbiote)
 # → dist/android-arm64/goauld-injector
 # → dist/android-arm64/libgoauld_agent.so
+# or:
+# cargo build -p goauld-agent --no-default-features --features symbiote \
+#   --release --target aarch64-linux-android
+```
+
+JS engines are **compile-time** mutually exclusive features on `goauld-script` / `goauld-agent`:
+
+| Feature | Crate | Notes |
+| --- | --- | --- |
+| `quickjs` (default) | `rquickjs` | Full Frida-shaped surface + e2e fixtures |
+| `symbiote` | `symbiote-core` + `symbiote-jit` | Pure-Rust engine; Process/Memory/Module/send/timers subset first |
+
+Host smoke for both engines:
+
+```bash
+./scripts/test-js-engines.sh both    # js_engine_send_hi + js_engine_core_smoke
+./scripts/test-js-engines.sh quickjs
+./scripts/test-js-engines.sh symbiote
 ```
 
 Emulator: rooted AVD (e.g. `Goauld_API34`, `google_apis` arm64) with `adb root` + `setenforce 0`.
@@ -257,6 +276,50 @@ cargo run -p goauld-host --release -- attach \
   --expect-send java-perform-ok --max-wait-secs 15
 ```
 
+### Arm64Writer / Arm64Relocator
+
+Runnable recipes in `scripts/fixtures/arm64_writer_examples.js` (callable stub,
+`Memory.patchCode` + writer, labels/CBZ, trampoline relocator, call-with-args):
+
+```bash
+cargo run -p goauld-host --release -- attach \
+  --pid "$(adb shell pidof -s com.example.javatarget | tr -d '\r')" \
+  --port 27046 \
+  --script scripts/fixtures/arm64_writer_examples.js \
+  --expect-send arm64-examples-ok --max-wait-secs 20
+```
+
+API smoke: `scripts/fixtures/arm64_writer.js` (`arm64-writer-ok`).
+
+Minimal patterns:
+
+```javascript
+// Emit + call a stub
+var code = Memory.alloc(Process.pageSize);
+Memory.protect(code, Process.pageSize, 'rwx');
+var w = new Arm64Writer(code);
+w.putLdrRegU64(Register.x0, 99);
+w.putRet();
+w.flush();
+// __goauld.call0(code.address) → 99
+
+// Classic Frida patchCode + writer
+Memory.patchCode(target, 16, function (code) {
+  var w = new Arm64Writer(code);
+  w.putInstruction((0xD2800000 | (7 << 5)) >>> 0); // MOVZ X0, #7
+  w.putRet();
+  w.flush();
+  w.dispose();
+});
+
+// Relocate displaced instructions into a trampoline
+var dstW = new Arm64Writer(trampoline);
+var reloc = new Arm64Relocator(hookSite, dstW);
+reloc.readOne(); reloc.writeOne();
+reloc.readOne(); reloc.writeOne();
+dstW.flush();
+```
+
 ### Hello / Process·Module·Memory smoke
 
 ```bash
@@ -288,6 +351,8 @@ cargo run -p goauld-host --release -- attach \
 | `thread_backtrace.js` | `Thread.backtrace` / `Backtracer` | `backtrace-ok` |
 | `memory_scan.js` | `Memory.scan` / `scanSync` | `memory-scan-ok` |
 | `memory_patch.js` | `Memory.patchCode` | `memory-patch-ok` |
+| `arm64_writer.js` | `Arm64Writer` / `Arm64Relocator` / AArch64 enums | `arm64-writer-ok` |
+| `arm64_writer_examples.js` | Callable stub, `patchCode`+writer, labels, relocator, call-with-args | `arm64-examples-ok` |
 | `memory_access.js` | `MemoryAccessMonitor` | `memory-access-ok` |
 | `module_enumerate.js` | Module exports/imports/symbols/sections/deps | `module-enum-ok` |
 | `misc_apis.js` | console / hexdump / timers / gc / Cloak / Profiler | `misc-apis-ok` |

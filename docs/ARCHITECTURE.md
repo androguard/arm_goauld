@@ -585,7 +585,7 @@ directly.
   plain heap buffers standing in for a real `ArtMethod`), and the full QuickJS
   `Java.use`/`implementation`/`this.method()`/exception-handling flow (against the
   in-process `js_queue` worker, without any real ART underneath — see the
-  `#[cfg(feature = "quickjs")]` tests in `crates/goauld-script/src/engine.rs`).
+  `js_engine_*` + Java tests in `crates/goauld-script/src/engine.rs`; run both engines via `./scripts/test-js-engines.sh`).
 - `./scripts/run_milestone.sh <1..8|unit|device-smoke|all>` and `./scripts/emulator.sh`
   drive the device-dependent integration milestones listed in `README.md` against a
   rooted AVD (SELinux permissive, `ptrace_scope=0`).

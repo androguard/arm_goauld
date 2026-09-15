@@ -5,11 +5,13 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-description = "goauld QuickJS embedding + Frida-shaped JS API"
+description = "goauld JS embedding (QuickJS or Symbiote) + Frida-shaped JS API"
 
 [features]
 default = ["quickjs"]
+# Exactly one JS engine should be enabled for a useful agent build.
 quickjs = ["dep:rquickjs"]
+symbiote = ["dep:symbiote-core", "dep:symbiote-jit"]
 
 [dependencies]
 goauld-proto = { workspace = true }
@@ -21,3 +23,5 @@ parking_lot = { workspace = true }
 serde_json = { workspace = true }
 libc = { workspace = true }
 rquickjs = { workspace = true, optional = true }
+symbiote-core = { workspace = true, optional = true, features = ["std"] }
+symbiote-jit = { workspace = true, optional = true }

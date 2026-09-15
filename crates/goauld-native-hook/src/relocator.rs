@@ -1,6 +1,6 @@
 //! Relocate displaced instructions into a trampoline (§4.3).
 
-use crate::decoder::{Arm64Decoder, Cond, DecodedInsn, InsnKind};
+use crate::decoder::{Arm64Decoder, Cond, DecodedInsn, DisasmAdapter, InsnKind};
 use crate::encode::{
     encode_abs_branch, encode_abs_call, encode_b_cond, encode_cbz, encode_ldr_lit_expanded,
     encode_pc_rel_addr, encode_tbz, try_encode_ldr_lit,
@@ -55,6 +55,8 @@ pub fn compute_patch_insns(
 pub enum RelocError {
     #[error("not enough code bytes to cover a 16-byte patch")]
     TruncatedCode,
+    #[error("address out of range / unreadable")]
+    OutOfRange,
     #[error("relocation failed: {0}")]
     Failed(String),
 }
@@ -92,7 +94,8 @@ pub fn build_trampoline(
     })
 }
 
-fn relocate_one(insn: &DecodedInsn, emit_pc: u64) -> Result<Vec<u8>, RelocError> {
+/// Relocate a single decoded instruction for emission at `emit_pc`.
+pub fn relocate_one(insn: &DecodedInsn, emit_pc: u64) -> Result<Vec<u8>, RelocError> {
     match &insn.kind {
         InsnKind::PcIndependent | InsnKind::BranchReg { .. } => {
             Ok(insn.raw.to_le_bytes().to_vec())
@@ -252,10 +255,196 @@ fn encode_abs_addr_into_x17(emit_pc: u64, addr: u64) -> Vec<u8> {
     out
 }
 
+/// Frida-style streaming relocator: read instructions from an input address
+/// and emit relocated equivalents into an [`crate::writer::Arm64Writer`].
+pub struct Arm64Relocator {
+    input: u64,
+    input_pc: u64,
+    eob: bool,
+    eoi: bool,
+    read_ahead: Vec<DecodedInsn>,
+    /// Optional in-memory source bytes (host/tests). When `None`, reads process memory.
+    source: Option<Vec<u8>>,
+    source_base: u64,
+    bytes_read: usize,
+}
+
+impl Arm64Relocator {
+    pub fn new(input_code: u64, _output_base: u64) -> Self {
+        Self {
+            input: input_code,
+            input_pc: input_code,
+            eob: false,
+            eoi: false,
+            read_ahead: Vec::new(),
+            source: None,
+            source_base: input_code,
+            bytes_read: 0,
+        }
+    }
+
+    /// Bind a local byte buffer as the instruction source (for tests / offline use).
+    pub fn with_source(mut self, base: u64, bytes: Vec<u8>) -> Self {
+        self.source_base = base;
+        self.input = base;
+        self.input_pc = base;
+        self.source = Some(bytes);
+        self
+    }
+
+    pub fn input(&self) -> Option<&DecodedInsn> {
+        self.read_ahead.last()
+    }
+
+    pub fn input_addr(&self) -> u64 {
+        self.input
+    }
+
+    pub fn eob(&self) -> bool {
+        self.eob
+    }
+
+    pub fn eoi(&self) -> bool {
+        self.eoi
+    }
+
+    fn read_u32_at(&self, addr: u64) -> Result<u32, RelocError> {
+        if let Some(ref src) = self.source {
+            let off = addr
+                .checked_sub(self.source_base)
+                .ok_or(RelocError::OutOfRange)? as usize;
+            if off + 4 > src.len() {
+                return Err(RelocError::OutOfRange);
+            }
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&src[off..off + 4]);
+            return Ok(u32::from_le_bytes(b));
+        }
+        if addr == 0 {
+            return Err(RelocError::OutOfRange);
+        }
+        let word = unsafe { std::ptr::read_unaligned(addr as *const u32) };
+        Ok(word)
+    }
+
+    /// Read the next instruction into the internal queue.
+    /// Returns total bytes read so far (including previous calls), or 0 at EOI.
+    pub fn read_one(&mut self) -> Result<usize, RelocError> {
+        if self.eoi {
+            return Ok(0);
+        }
+        let word = match self.read_u32_at(self.input_pc) {
+            Ok(w) => w,
+            Err(_) => {
+                self.eoi = true;
+                return Ok(0);
+            }
+        };
+        let decoder = DisasmAdapter;
+        let insn = decoder.decode(self.input_pc, word);
+        match &insn.kind {
+            InsnKind::Branch { link: false, .. } | InsnKind::BranchReg { .. } => {
+                self.eob = true;
+                self.eoi = true;
+            }
+            InsnKind::Branch { link: true, .. } => {
+                self.eob = true;
+            }
+            InsnKind::BranchCond { .. }
+            | InsnKind::CompareBranch { .. }
+            | InsnKind::TestBranch { .. } => {
+                self.eob = true;
+            }
+            _ => {}
+        }
+        self.read_ahead.push(insn);
+        self.input_pc = self.input_pc.wrapping_add(4);
+        self.bytes_read += 4;
+        Ok(self.bytes_read)
+    }
+
+    pub fn peek_next_write_source(&self) -> Option<u64> {
+        self.read_ahead.first().map(|i| i.addr)
+    }
+
+    pub fn peek_next_write_insn(&self) -> Option<&DecodedInsn> {
+        self.read_ahead.first()
+    }
+
+    /// Copy next buffered instruction without relocating.
+    pub fn copy_one(&mut self, writer: &mut crate::writer::Arm64Writer) -> Result<bool, RelocError> {
+        if self.read_ahead.is_empty() {
+            if self.read_one()? == 0 {
+                return Ok(false);
+            }
+        }
+        let insn = self.read_ahead.remove(0);
+        writer.put_instruction(insn.raw);
+        self.input = insn.addr.wrapping_add(4);
+        Ok(true)
+    }
+
+    /// Relocate next buffered instruction into `writer`.
+    pub fn write_one(&mut self, writer: &mut crate::writer::Arm64Writer) -> Result<bool, RelocError> {
+        if self.read_ahead.is_empty() {
+            if self.read_one()? == 0 {
+                return Ok(false);
+            }
+        }
+        let insn = self.read_ahead.remove(0);
+        let bytes = relocate_one(&insn, writer.pc())?;
+        writer.put_raw(&bytes);
+        self.input = insn.addr.wrapping_add(4);
+        Ok(true)
+    }
+
+    pub fn skip_one(&mut self) -> Result<bool, RelocError> {
+        if self.read_ahead.is_empty() {
+            if self.read_one()? == 0 {
+                return Ok(false);
+            }
+        }
+        let insn = self.read_ahead.remove(0);
+        self.input = insn.addr.wrapping_add(4);
+        Ok(true)
+    }
+
+    /// Relocate all buffered instructions, reading until eoi if needed.
+    pub fn write_all(&mut self, writer: &mut crate::writer::Arm64Writer) -> Result<(), RelocError> {
+        loop {
+            if self.read_ahead.is_empty() && !self.eoi {
+                if self.read_one()? == 0 {
+                    break;
+                }
+            }
+            if self.read_ahead.is_empty() {
+                break;
+            }
+            self.write_one(writer)?;
+        }
+        Ok(())
+    }
+
+    pub fn reset(&mut self, input_code: u64, _output_base: u64) {
+        self.input = input_code;
+        self.input_pc = input_code;
+        self.eob = false;
+        self.eoi = false;
+        self.read_ahead.clear();
+        self.bytes_read = 0;
+        if self.source.is_some() {
+            self.source_base = input_code;
+        }
+    }
+
+    pub fn dispose(self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::decoder::DisasmAdapter;
+    use crate::writer::Arm64Writer;
 
     #[test]
     fn patch_covers_four_nops() {
@@ -283,5 +472,15 @@ mod tests {
         let block = build_trampoline(&d, 0x1000, &code, 0xBBBB_0000).unwrap();
         // First relocated insn expands to 16-byte abs branch
         assert!(block.code.len() > 32);
+    }
+
+    #[test]
+    fn streaming_relocator_nops() {
+        let code = [0x1Fu8, 0x20, 0x03, 0xD5].repeat(4);
+        let mut w = Arm64Writer::new(0x2000, None);
+        let mut r = Arm64Relocator::new(0x1000, w.base()).with_source(0x1000, code);
+        assert!(r.read_one().unwrap() > 0);
+        assert!(r.write_one(&mut w).unwrap());
+        assert_eq!(w.offset(), 4);
     }
 }

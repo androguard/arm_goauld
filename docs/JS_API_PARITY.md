@@ -2,8 +2,15 @@
 
 Target reference: [Frida JavaScript API](https://frida.re/docs/javascript-api/).
 
-This document tracks goauld’s Frida-shaped JS surface (QuickJS on Android/arm64) versus
-that reference. Scope is **Android + AArch64 only** — iOS/ObjC, Windows, and other arches
+This document tracks goauld’s Frida-shaped JS surface (Android/arm64) versus
+that reference. The agent selects a JS engine at **compile time**:
+
+- **`quickjs`** (default) — full surface tracked below
+- **`symbiote`** — path dependency on [`../../symbiote`](../../../symbiote); same shared `frida_prelude` + `host_ops` surface as QuickJS (`Script.runtime === 'SYMBIOTE'`). Java Technique-A invoke remains QuickJS-preferred.
+
+Host smoke for both: `./scripts/test-js-engines.sh both` (`js_engine_send_hi`, `js_engine_core_smoke`, `js_engine_modules_exposed`, `js_engine_arm64_writer_smoke`).
+
+Scope is **Android + AArch64 only** — iOS/ObjC, Windows, and other arches
 are out of project scope unless noted.
 
 ## Legend
@@ -45,7 +52,7 @@ Reference: [Communication between host and injected process](https://frida.re/do
 | API                                        | Status                               |
 | ------------------------------------------ | ------------------------------------ |
 | `Frida.version` / `Frida.heapSize`         | **planned**                          |
-| `Script.runtime`                           | **partial** — always QJS in practice |
+| `Script.runtime`                           | **partial** — `QJS` or `SYMBIOTE` from compile-time feature |
 | `Script.evaluate` / `load` / source maps   | **planned**                          |
 | `Script.nextTick` / pin / unpin / bindWeak | **planned**                          |
 
@@ -145,12 +152,16 @@ Reference: [Communication between host and injected process](https://frida.re/do
 ## CPU writers / relocators
 
 
-| API                     | Status                                                         |
-| ----------------------- | -------------------------------------------------------------- |
-| Arm64Writer / Relocator | **partial** — internal in `goauld-native-hook`, not JS-exposed |
-| Other arches            | **n/a**                                                        |
+| API                     | Status                                                                 |
+| ----------------------- | ---------------------------------------------------------------------- |
+| Arm64Writer             | **done** — Frida-shaped API (emit / labels / flush / calls / push-all) |
+| Arm64Relocator          | **done** — streaming readOne/writeOne/writeAll/skipOne               |
+| AArch64 enums           | **done** — `Register` (incl. Q) / `ConditionCode` / `IndexMode`      |
+| Other arches            | **n/a**                                                                |
 
-
+**Fixtures:**
+- `scripts/fixtures/arm64_writer.js` (`--expect-send arm64-writer-ok`) — API smoke
+- `scripts/fixtures/arm64_writer_examples.js` (`--expect-send arm64-examples-ok`) — callable stub, `patchCode`+writer, labels, trampoline relocator, call-with-args
 
 
 ## Other

@@ -2,9 +2,33 @@
 # Build on-device arm64 Android artifacts without relying on cargo-ndk:
 #   - goauld-injector
 #   - libgoauld_agent.so
+#
+# Usage:
+#   ./scripts/build-android.sh              # QuickJS (default)
+#   ./scripts/build-android.sh quickjs
+#   ./scripts/build-android.sh symbiote
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+JS_ENGINE="${1:-quickjs}"
+case "$JS_ENGINE" in
+  -h|--help|help)
+    cat <<EOF
+Usage: $0 [quickjs|symbiote]
+
+Build arm64 Android injector + agent.
+  quickjs   (default) rquickjs / full Frida surface
+  symbiote  pure-Rust engine (path dep ../../symbiote)
+EOF
+    exit 0
+    ;;
+  quickjs|symbiote) ;;
+  *)
+    echo "usage: $0 [quickjs|symbiote] (got: $JS_ENGINE)" >&2
+    exit 1
+    ;;
+esac
 
 API="$(grep '^API_LEVEL=' ndk.txt | cut -d= -f2 || true)"
 API="${API:-26}"
@@ -37,8 +61,16 @@ echo "== goauld version (from goauld-proto build.rs) will embed git+UTC =="
 echo "== building goauld-injector =="
 cargo build -p goauld-injector --release --target aarch64-linux-android
 
-echo "== building goauld-agent (quickjs + bindgen for android) =="
-cargo build -p goauld-agent --release --target aarch64-linux-android 2>&1 | tee /tmp/goauld-agent-build.log | tail -40
+echo "== building goauld-agent (JS engine=$JS_ENGINE) =="
+case "$JS_ENGINE" in
+  quickjs)
+    AGENT_FEATURES=(--features quickjs)
+    ;;
+  symbiote)
+    AGENT_FEATURES=(--no-default-features --features symbiote)
+    ;;
+esac
+cargo build -p goauld-agent --release --target aarch64-linux-android "${AGENT_FEATURES[@]}" 2>&1 | tee /tmp/goauld-agent-build.log | tail -40
 
 NDK_OUT="${ROOT}/target/aarch64-linux-android/release"
 cp -f "${NDK_OUT}/goauld-injector" "${OUT}/goauld-injector"
@@ -50,6 +82,7 @@ chmod +x "${OUT}/goauld-injector"
   echo "pkg=$(cargo metadata --no-deps --format-version 1 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -1)"
   echo "git=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "js=${JS_ENGINE}"
 } > "${OUT}/VERSION.txt"
 file "${OUT}/goauld-injector" "${OUT}/libgoauld_agent.so"
 ls -la "$OUT"

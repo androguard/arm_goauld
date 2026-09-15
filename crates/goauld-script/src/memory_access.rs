@@ -14,14 +14,20 @@ use std::sync::Once;
 #[derive(Clone)]
 struct PageEntry {
     prev_prot: i32,
+    // Read from the SEGV handler (linux/android only).
+    #[allow(dead_code)]
     range_index: usize,
+    #[allow(dead_code)]
     page_index: usize,
+    #[allow(dead_code)]
     completed: bool,
 }
 
 struct MonitorState {
     pages: HashMap<u64, PageEntry>,
+    #[allow(dead_code)] // read from SEGV handler (linux/android)
     pages_total: usize,
+    #[allow(dead_code)]
     pages_completed: usize,
 }
 
@@ -356,6 +362,7 @@ fn chain_previous(sig: libc::c_int, info: *mut libc::siginfo_t, uctx: *mut libc:
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Clone, Copy)]
 enum Op {
     Read,
@@ -411,6 +418,7 @@ fn classify_arm64_access(pc: u64) -> Op {
     Op::Read
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn write_event(ev: &WireEvent) {
     let fd = PIPE_WR.load(Ordering::SeqCst);
     if fd < 0 {

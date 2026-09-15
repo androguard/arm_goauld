@@ -35,6 +35,7 @@ pub struct JavaHook {
 
 static HOOKS: RwLock<Vec<JavaHook>> = RwLock::new(Vec::new());
 
+#[cfg(target_os = "android")]
 pub(crate) fn push_hook_backup(target: usize, saved: Vec<u8>) {
     HOOKS.write().push(JavaHook {
         target,

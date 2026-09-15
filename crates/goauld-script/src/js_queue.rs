@@ -103,9 +103,9 @@ fn worker_loop(rx: Receiver<JsJob>) {
                 source,
                 reply,
             } => {
-                #[cfg(feature = "quickjs")]
-                let r = crate::bindings::worker_eval(script_id, &source);
-                #[cfg(not(feature = "quickjs"))]
+                #[cfg(any(feature = "quickjs", feature = "symbiote"))]
+                let r = crate::js_backend::worker_eval(script_id, &source);
+                #[cfg(not(any(feature = "quickjs", feature = "symbiote")))]
                 let r = {
                     let _ = (script_id, source);
                     Err("quickjs disabled".into())
@@ -113,19 +113,19 @@ fn worker_loop(rx: Receiver<JsJob>) {
                 let _ = reply.send(r);
             }
             JsJob::EvalAsync { source } => {
-                #[cfg(feature = "quickjs")]
+                #[cfg(any(feature = "quickjs", feature = "symbiote"))]
                 {
-                    let _ = crate::bindings::worker_eval(0, &source);
+                    let _ = crate::js_backend::worker_eval(0, &source);
                 }
-                #[cfg(not(feature = "quickjs"))]
+                #[cfg(not(any(feature = "quickjs", feature = "symbiote")))]
                 {
                     let _ = source;
                 }
             }
             JsJob::JavaInvoke(job) => {
-                #[cfg(feature = "quickjs")]
-                crate::bindings::worker_java_invoke(job);
-                #[cfg(not(feature = "quickjs"))]
+                #[cfg(any(feature = "quickjs", feature = "symbiote"))]
+                crate::js_backend::worker_java_invoke(job);
+                #[cfg(not(any(feature = "quickjs", feature = "symbiote")))]
                 {
                     let _ = job.reply.send(JavaInvokeResult {
                         value: job.arg.saturating_add(1000),
@@ -134,9 +134,9 @@ fn worker_loop(rx: Receiver<JsJob>) {
                 }
             }
             JsJob::HostPost { payload_json, data } => {
-                #[cfg(feature = "quickjs")]
-                crate::bindings::worker_deliver_post(&payload_json, data.as_deref());
-                #[cfg(not(feature = "quickjs"))]
+                #[cfg(any(feature = "quickjs", feature = "symbiote"))]
+                crate::js_backend::worker_deliver_post(&payload_json, data.as_deref());
+                #[cfg(not(any(feature = "quickjs", feature = "symbiote")))]
                 {
                     let _ = (payload_json, data);
                 }
@@ -147,13 +147,13 @@ fn worker_loop(rx: Receiver<JsJob>) {
                 args_json,
                 reply,
             } => {
-                #[cfg(feature = "quickjs")]
+                #[cfg(any(feature = "quickjs", feature = "symbiote"))]
                 {
-                    let r = crate::bindings::worker_rpc_call(&fn_name, &args_json);
+                    let r = crate::js_backend::worker_rpc_call(&fn_name, &args_json);
                     let _ = call_id;
                     let _ = reply.send(r);
                 }
-                #[cfg(not(feature = "quickjs"))]
+                #[cfg(not(any(feature = "quickjs", feature = "symbiote")))]
                 {
                     let _ = call_id;
                     let _ = reply.send(RpcInvokeResult {
@@ -168,12 +168,12 @@ fn worker_loop(rx: Receiver<JsJob>) {
                 regs,
                 reply,
             } => {
-                #[cfg(feature = "quickjs")]
+                #[cfg(any(feature = "quickjs", feature = "symbiote"))]
                 {
-                    let out = crate::bindings::worker_interceptor_enter(hook_id, regs);
+                    let out = crate::js_backend::worker_interceptor_enter(hook_id, regs);
                     let _ = reply.send(out);
                 }
-                #[cfg(not(feature = "quickjs"))]
+                #[cfg(not(any(feature = "quickjs", feature = "symbiote")))]
                 {
                     let _ = reply.send(regs);
                     let _ = hook_id;
@@ -184,12 +184,12 @@ fn worker_loop(rx: Receiver<JsJob>) {
                 retval,
                 reply,
             } => {
-                #[cfg(feature = "quickjs")]
+                #[cfg(any(feature = "quickjs", feature = "symbiote"))]
                 {
-                    let out = crate::bindings::worker_interceptor_leave(hook_id, retval);
+                    let out = crate::js_backend::worker_interceptor_leave(hook_id, retval);
                     let _ = reply.send(out);
                 }
-                #[cfg(not(feature = "quickjs"))]
+                #[cfg(not(any(feature = "quickjs", feature = "symbiote")))]
                 {
                     let _ = reply.send(retval);
                     let _ = hook_id;
@@ -267,11 +267,11 @@ pub fn is_started() -> bool {
 /// Run Interceptor onEnter on the JS worker; returns possibly-mutated x0..x7.
 pub fn submit_interceptor_enter(hook_id: u32, regs: [u64; 8], timeout: Duration) -> [u64; 8] {
     if is_js_worker_thread() {
-        #[cfg(feature = "quickjs")]
+        #[cfg(any(feature = "quickjs", feature = "symbiote"))]
         {
-            return crate::bindings::worker_interceptor_enter(hook_id, regs);
+            return crate::js_backend::worker_interceptor_enter(hook_id, regs);
         }
-        #[cfg(not(feature = "quickjs"))]
+        #[cfg(not(any(feature = "quickjs", feature = "symbiote")))]
         {
             return regs;
         }
@@ -296,11 +296,11 @@ pub fn submit_interceptor_enter(hook_id: u32, regs: [u64; 8], timeout: Duration)
 /// Run Interceptor onLeave on the JS worker; returns possibly-mutated retval.
 pub fn submit_interceptor_leave(hook_id: u32, retval: u64, timeout: Duration) -> u64 {
     if is_js_worker_thread() {
-        #[cfg(feature = "quickjs")]
+        #[cfg(any(feature = "quickjs", feature = "symbiote"))]
         {
-            return crate::bindings::worker_interceptor_leave(hook_id, retval);
+            return crate::js_backend::worker_interceptor_leave(hook_id, retval);
         }
-        #[cfg(not(feature = "quickjs"))]
+        #[cfg(not(any(feature = "quickjs", feature = "symbiote")))]
         {
             return retval;
         }

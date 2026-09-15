@@ -85,7 +85,9 @@ inject_into() {
 milestone_unit() {
   echo "== host unit tests (proto/native-hook/script/art) =="
   cd "$ROOT"
-  cargo test -p goauld-proto -p goauld-native-hook -p goauld-script -p goauld-art-bridge -q
+  cargo test -p goauld-proto -p goauld-native-hook -p goauld-art-bridge -q
+  # Both JS engines (mutually exclusive features — run separately).
+  "$ROOT/scripts/test-js-engines.sh" both
   echo "OK unit"
 }
 
@@ -113,10 +115,10 @@ milestone_2() {
 milestone_3() {
   echo "== milestone 3: script round-trip send(\"hi\") =="
   cd "$ROOT"
-  cargo test -p goauld-script load_send_hi_emits -- --nocapture
+  "$ROOT/scripts/test-js-engines.sh" both
   ensure_host
   if ! need_device >/dev/null; then
-    echo "NOTE: no device — host QuickJS only"
+    echo "NOTE: no device — host engines only"
     echo "OK milestone 3 (host)"
     return 0
   fi
