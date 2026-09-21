@@ -422,6 +422,29 @@ fn adb(serial: Option<&str>) -> Command {
     c
 }
 
+/// Ensure `tcp:{port}` forwards to `localabstract:{name}`.
+///
+/// Skips remove+add when the forward is already correct — each adb round-trip is
+/// ~10–20 ms on emulator and dominated script-load ping before this change.
+fn ensure_adb_forward(serial: Option<&str>, port: u16, abstract_name: &str) -> Result<()> {
+    let spec = format!("tcp:{port}");
+    let local = format!("localabstract:{abstract_name}");
+    let listed = adb(serial).args(["forward", "--list"]).output()?;
+    let list = String::from_utf8_lossy(&listed.stdout);
+    let already = list.lines().any(|line| {
+        let parts: Vec<_> = line.split_whitespace().collect();
+        // serial tcp:PORT localabstract:NAME
+        parts.len() >= 3 && parts[1] == spec && parts[2] == local
+    });
+    if already {
+        return Ok(());
+    }
+    let _ = adb(serial).args(["forward", "--remove", &spec]).status();
+    eprintln!("adb forward {spec} {local}");
+    run_checked(adb(serial).args(["forward", &spec, &local]))?;
+    Ok(())
+}
+
 fn cmd_ps(serial: Option<&str>) -> Result<()> {
     let out = adb(serial).args(["shell", "ps", "-A"]).output()?;
     if !out.status.success() {
@@ -771,11 +794,7 @@ fn cmd_attach(
     let agent_name = pid.map(|p| format!("goauld-agent-{p}"));
     if let Some(pid) = pid {
         let name = format!("goauld-agent-{pid}");
-        let spec = format!("tcp:{port}");
-        let local = format!("localabstract:{name}");
-        eprintln!("adb forward {spec} {local}");
-        let _ = adb(serial).args(["forward", "--remove", &spec]).status();
-        run_checked(adb(serial).args(["forward", &spec, &local]))?;
+        ensure_adb_forward(serial, port, &name)?;
     }
 
     // Agent ctor thread may need a beat after dlopen before accept().
@@ -784,7 +803,12 @@ fn cmd_attach(
     for attempt in 1..=20 {
         match TcpStream::connect(("127.0.0.1", port)) {
             Ok(mut s) => {
-                let _ = s.set_read_timeout(Some(Duration::from_millis(750)));
+                let _ = s.set_nodelay(true);
+                let _ = s.set_read_timeout(Some(Duration::from_millis(if attempt == 1 {
+                    250
+                } else {
+                    750
+                })));
                 match read_msg(&mut s) {
                     Ok(msg) => {
                         established = Some((s, msg));
@@ -799,7 +823,10 @@ fn cmd_attach(
             Err(e) => last_err = Some(e),
         }
         if attempt < 20 {
-            std::thread::sleep(Duration::from_millis(100));
+            // Agent is usually already listening after inject; keep early
+            // retries cheap instead of a flat 100 ms sleep.
+            let backoff_ms = if attempt <= 3 { 15 } else { 50 };
+            std::thread::sleep(Duration::from_millis(backoff_ms));
         }
     }
     let (mut stream, hello) = match established {

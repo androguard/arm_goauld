@@ -28,6 +28,38 @@ adapts String mirror decoding for API &lt; 26 vs 26+.
 Ptrace **must** run on-device. The desktop CLI never attaches to app processes itself;
 it deploys `goauld-injector` + the agent `.so` and executes the injector as root.
 
+## Frida, the reference
+
+[Frida](https://frida.re/) is the instrumentation toolkit this project is measured against.
+It is the mature, cross-platform reference: Stalker, Gum, a complete JS runtime, `frida-server` /
+`frida-gadget`, and the ecosystem of tools and scripts people already use. goauld is a smaller
+**Android / arm64 alternative** that borrows a Frida-shaped JS surface (`send`, `Interceptor`,
+`Java`, `Process`, `Module`, `Memory`, `Arm64Writer`) so scripts can look familiar. It is not a
+Frida replacement. If you need Frida’s coverage, platforms, or tooling, use Frida.
+
+API gaps versus that surface are tracked in [`docs/JS_API_PARITY.md`](docs/JS_API_PARITY.md).
+
+A single emulator snapshot (API 34, `arm64-v8a`, same script, `Date.now` median of 3) is below
+so the difference is concrete. Numbers move with the build and the device; re-run
+`scripts/bench-js-engines.py` rather than treating this table as a ranking. Frida 17.18.0 is
+the baseline. Lower is better.
+
+| | goauld / QuickJS | Frida 17.18.0 |
+|---|---:|---:|
+| Script load (session already up) | 2.6 ms | **2.0 ms** |
+| Inject (adb push of injector + agent, then ptrace, every time) | 370 ms | — |
+| Attach (`frida-server` already running; the 56 MB push is not included) | — | **53 ms** |
+| Integer add | **48 ns/op** | 74 ns/op |
+| Property get | **109 ns/op** | 147 ns/op |
+| Call | **112 ns/op** | 145 ns/op |
+| `readU32` | **230 ns/op** | 2.2 µs/op |
+| String append | 2.7 µs/op | **1.7 µs/op** |
+| Object alloc | 1.0 µs/op | **0.9 µs/op** |
+| `send` | **2 µs/msg** | 14 µs/msg |
+| Agent PSS at idle | **~1.6 MB** | ~6 MB |
+
+Those two startup rows are not the same operation. goauld's 370 ms repeats the push; Frida's 53 ms is only `attach` after `frida-server` is already up. Frida stays ahead on strings and allocation, and on everything this table does not measure (other ABIs, Stalker, the CLI, existing scripts). QuickJS here is a narrower agent that, on this one device, was quicker on tight loops, memory reads, and `send`. The Symbiote engine is a second, pure-Rust backend of the same API and is still well behind both Frida and QuickJS on those loops.
+
 ## Workspace
 
 | Crate | Role |
@@ -370,7 +402,7 @@ Deeper design notes: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Milestones
 
-Integration harness: `./scripts/run_milestone.sh <unit|1|2|3|4|5|6|apk|e2e|device-smoke|all>`
+Integration harness: `./scripts/run_milestone.sh <unit|1|2|3|4|5|6|apk|e2e|device-smoke|symbiote|all>`
 
 | # | Goal | Status |
 |---|---|---|
@@ -387,6 +419,8 @@ Integration harness: `./scripts/run_milestone.sh <unit|1|2|3|4|5|6|apk|e2e|devic
 ./scripts/build-android.sh
 cargo build -p goauld-host --release
 ./scripts/run_milestone.sh all
+# Symbiote agent on the emulator (separate dist, does not replace QuickJS):
+./scripts/test-symbiote-emulator.sh
 # or APK suite only:
 ./scripts/run_e2e_apk.sh
 ./scripts/run_e2e_apk.sh syscalls android-api toast

@@ -157,6 +157,9 @@ mod imp {
                             let call =
                                 format_syscall_call(pid, &name, &ent.args, Some(retval));
                             let _ = writeln!(out, "[{tid}] {call} = {retval:#x}");
+                            // adb shell is not a tty, so stdout is block-buffered.
+                            // Flush each line or the host sees nothing until exit.
+                            let _ = out.flush();
                         }
                     }
                 } else {
@@ -178,6 +181,7 @@ mod imp {
                         // Enter: write* buffers are already valid; read* not yet filled.
                         let call = format_syscall_call(pid, &name, &args, None);
                         let _ = writeln!(out, "[{tid}] → {call}");
+                        let _ = out.flush();
                     }
                     if pass {
                         events += 1;

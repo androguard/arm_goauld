@@ -85,10 +85,83 @@ pub fn resolve_abi(pid: u32) -> Result<String, DiscoverError> {
 }
 
 pub fn find_by_package(package: &str) -> Result<ProcessInfo, DiscoverError> {
-    enumerate_processes()?
-        .into_iter()
-        .find(|p| p.package.as_deref() == Some(package) || p.cmdline.contains(package))
-        .ok_or_else(|| DiscoverError::NotFound(package.into()))
+    let skip = ancestor_pids();
+    let mut hits: Vec<(u32, ProcessInfo)> = Vec::new();
+    for proc in enumerate_processes()? {
+        if skip.contains(&proc.pid) {
+            continue;
+        }
+        let first = proc.cmdline.split_whitespace().next().unwrap_or("");
+        let is_app = first == package || first.starts_with(&format!("{package}:"));
+        if !is_app {
+            if proc.cmdline.contains(package) {
+                eprintln!(
+                    "goauld-inject: ignoring pid={} uid={} (not the app process) {}",
+                    proc.pid,
+                    proc_uid(proc.pid),
+                    clip_cmd(&proc.cmdline)
+                );
+            }
+            continue;
+        }
+        let uid = proc_uid(proc.pid);
+        eprintln!(
+            "goauld-inject: app candidate pid={} uid={uid} cmd={}",
+            proc.pid,
+            clip_cmd(&proc.cmdline)
+        );
+        hits.push((uid, proc));
+    }
+    let mut apps: Vec<(u32, ProcessInfo)> = hits.into_iter().filter(|(uid, _)| *uid >= 10_000).collect();
+    if apps.is_empty() {
+        return Err(DiscoverError::NotFound(format!(
+            "{package} (no running app process; a shell mentioning the name does not count)"
+        )));
+    }
+    apps.sort_by_key(|(uid, proc)| {
+        let first = proc.cmdline.split_whitespace().next().unwrap_or("");
+        let main = if first == package { 0u8 } else { 1 };
+        (main, *uid, proc.pid)
+    });
+    Ok(apps.remove(0).1)
+}
+
+fn proc_uid(pid: u32) -> u32 {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// This injector plus the su/timeout/sh parents that invoked it.
+fn ancestor_pids() -> std::collections::HashSet<u32> {
+    let mut set = std::collections::HashSet::new();
+    let mut pid = std::process::id();
+    set.insert(pid);
+    for _ in 0..32 {
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let ppid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|r| r.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        if ppid <= 1 || !set.insert(ppid) {
+            break;
+        }
+        pid = ppid;
+    }
+    set
+}
+
+fn clip_cmd(cmd: &str) -> String {
+    let mut s: String = cmd.chars().take(140).collect();
+    if cmd.chars().count() > 140 {
+        s.push('…');
+    }
+    s
 }
 
 fn guess_package(cmdline: &str) -> Option<String> {
@@ -116,5 +189,17 @@ mod tests {
             Some("com.example.native_target".into())
         );
         assert_eq!(guess_package("/system/bin/surfaceflinger"), None);
+    }
+
+    #[test]
+    fn app_process_name_is_not_a_shell_command() {
+        let pkg = "com.google.android.calculator";
+        let app = format!("{pkg}");
+        let sub = format!("{pkg}:privileged");
+        let shell = format!("timeout 120 su 0 sh -c '/data/local/tmp/goauld-injector inject --package {pkg}'");
+        assert!(app.split_whitespace().next() == Some(pkg));
+        assert!(sub.split_whitespace().next().unwrap().starts_with(&format!("{pkg}:")));
+        assert_ne!(shell.split_whitespace().next(), Some(pkg));
+        assert!(shell.contains(pkg));
     }
 }

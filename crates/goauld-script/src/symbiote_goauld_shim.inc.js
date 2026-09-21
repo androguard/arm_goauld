@@ -94,5 +94,8 @@ var __goauld = {
   javaHook: function(className, method, sig) { return __host('javaHook', [className, method, sig]); },
   javaCallOriginal: function(key, x) { return __host('javaCallOriginal', [key, x]); },
   androidToast: function(msg) { return __host('androidToast', [msg]); },
-  traceAndroidApi: function(cfg) { return __host('traceAndroidApi', [cfg]); },
+  stopAndroidApiTrace: function() { return __host('stopAndroidApiTrace', []); },
+  traceAndroidApi: function(filter, maxEvents) {
+    return __host('traceAndroidApi', [filter, maxEvents == null ? 0 : maxEvents]);
+  },
 };

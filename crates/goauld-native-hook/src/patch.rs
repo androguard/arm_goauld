@@ -92,6 +92,15 @@ pub fn attach_with_decoder(
             block.code.len(),
         );
         clear_icache(scratch, RELOC_OFF + block.code.len());
+        #[cfg(all(target_arch = "aarch64", target_os = "android"))]
+        {
+            // W^X: thunk bytes are written; drop write so the scratch can execute.
+            let _ = libc::mprotect(
+                scratch as *mut libc::c_void,
+                scratch_cap,
+                libc::PROT_READ | libc::PROT_EXEC,
+            );
+        }
     }
 
     let leave_thunk = if need_leave {
@@ -242,11 +251,17 @@ fn restore_bytes(entry: &HookEntry) -> Result<(), HookError> {
 fn alloc_exec(len: usize) -> Result<*mut u8, HookError> {
     #[cfg(unix)]
     {
+        // Return a *writable* page. macOS (and W^X kernels) SIGBUS if we write a
+        // mapping that is already PROT_EXEC. Caller flips to RX after the copy.
+        #[cfg(target_os = "macos")]
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        #[cfg(not(target_os = "macos"))]
+        let prot = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
         let page = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 len,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                prot,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
                 0,
@@ -265,11 +280,6 @@ fn alloc_exec(len: usize) -> Result<*mut u8, HookError> {
             };
             if page == libc::MAP_FAILED {
                 return Err(HookError::Mmap);
-            }
-            let rc = unsafe { libc::mprotect(page, len, libc::PROT_READ | libc::PROT_EXEC) };
-            if rc != 0 {
-                #[cfg(all(target_arch = "aarch64", target_os = "android"))]
-                return Err(HookError::Mprotect(rc));
             }
             return Ok(page as *mut u8);
         }
@@ -309,4 +319,18 @@ fn page_size() -> usize {
 #[allow(dead_code)]
 fn page_align(addr: usize) -> usize {
     addr & !(page_size() - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trampoline::HookCallbacks;
+
+    #[test]
+    fn attach_nops_does_not_fault() {
+        let buf = vec![0x1fu8, 0x20, 0x03, 0xD5].repeat(8);
+        let code = buf[..16].to_vec();
+        let r = attach(buf.as_ptr() as u64, &code, HookCallbacks::default());
+        assert!(r.is_ok(), "{}", r.as_ref().err().map(|e| e.to_string()).unwrap_or_default());
+    }
 }

@@ -71,6 +71,7 @@ NativePointer.prototype.sub = function(n) { return new NativePointer(this.addres
 NativePointer.prototype.toString = function() {
   return '0x' + __goauld_hex_u32(this.address);
 };
+NativePointer.prototype.valueOf = function() { return this.address; };
 "#;
 
 const SYMBIOTE_SHIM: &str = include_str!("symbiote_goauld_shim.inc.js");
@@ -212,6 +213,7 @@ impl SymEngine {
         context
             .eval(&boot)
             .map_err(|e| format!("symbiote prelude: {e}"))?;
+        wire_art_callbacks();
         Ok(Self {
             _runtime: runtime,
             context,
@@ -256,10 +258,95 @@ pub fn worker_eval(script_id: ScriptId, source: &str) -> Result<(), String> {
 }
 
 pub fn worker_java_invoke(job: JavaInvokeJob) {
-    let _ = job.reply.send(JavaInvokeResult {
-        value: job.arg.saturating_add(1000),
-        error: Some("Java invoke on Symbiote uses host stubs; prefer quickjs for Technique-A".into()),
+    let JavaInvokeJob {
+        key,
+        arg,
+        thiz,
+        art_method,
+        reply: reply_tx,
+    } = job;
+    let reply = |value: i32, error: Option<String>| {
+        let _ = reply_tx.send(JavaInvokeResult { value, error });
+    };
+    let Some(slot) = ENGINE_SLOT.lock().clone() else {
+        reply(arg.saturating_add(1000), Some("no Symbiote engine".into()));
+        return;
+    };
+
+    let key_json = serde_json::to_string(&key).unwrap_or_else(|_| "\"\"".into());
+    let run_js = |env_ptr: usize| -> Result<i32, String> {
+        goauld_art_bridge::set_hook_context(env_ptr, thiz, art_method);
+        let src = format!(
+            "(function(){{ var r = __goauld_java_invoke({key_json}, {arg}); return JSON.stringify(r == null ? {{did:false}} : r); }})()"
+        );
+        let parsed = {
+            let mut eng = slot.lock();
+            let out = eng.eval_string_result(&src);
+            goauld_art_bridge::clear_hook_context();
+            out
+        };
+        let s = parsed?;
+        let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| e.to_string())?;
+        let did = v.get("did").and_then(|x| x.as_bool()).unwrap_or(false);
+        if !did {
+            return Ok(arg.saturating_add(1000));
+        }
+        let ret = v.get("ret").and_then(|x| x.as_f64()).unwrap_or(arg as f64);
+        Ok(ret as i32)
+    };
+
+    #[cfg(target_os = "android")]
+    let result = goauld_art_bridge::with_attached_jni(|env| {
+        let env_ptr = env.get_raw() as usize;
+        run_js(env_ptr).map_err(goauld_art_bridge::ArtError::Msg)
     });
+    #[cfg(not(target_os = "android"))]
+    let result: Result<i32, goauld_art_bridge::ArtError> =
+        run_js(0).map_err(goauld_art_bridge::ArtError::Msg);
+
+    match result {
+        Ok(v) => reply(v, None),
+        Err(e) => {
+            log::error!("worker_java_invoke: {e}");
+            reply(arg.saturating_add(1000), Some(e.to_string()));
+        }
+    }
+}
+
+fn wire_art_callbacks() {
+    use std::sync::Once;
+    static WIRE: Once = Once::new();
+    WIRE.call_once(|| {
+        goauld_art_bridge::set_send_callback(art_send_cb);
+        goauld_art_bridge::set_js_invoke_callback(art_js_invoke_cb);
+        goauld_art_bridge::set_main_token_callback(art_main_token_cb);
+    });
+}
+
+fn art_send_cb(payload: &str) {
+    let Some(slot) = ENGINE_SLOT.lock().clone() else {
+        return;
+    };
+    let json = serde_json::to_string(payload).unwrap_or_else(|_| format!("\"{payload}\""));
+    let Some(eng) = slot.try_lock() else {
+        return;
+    };
+    eng.bridge.emit_send(json, None);
+}
+
+fn art_js_invoke_cb(key: &str, x: i32) -> Option<i32> {
+    let (_env, thiz, art) = goauld_art_bridge::current_hook_context()?;
+    crate::js_queue::submit_java_invoke(key, x, thiz, art, Duration::from_secs(10))
+}
+
+/// Called on the Android main looper — never touches the JS engine directly.
+fn art_main_token_cb(token: u64) {
+    let src = format!(
+        "try{{__goauld_runMain({token});}}catch(e){{try{{send('main-err:'+e);}}catch(_){{}}}}"
+    );
+    if let Err(e) = crate::js_queue::submit_eval_async(src) {
+        log::warn!("main token {token}: {e}");
+    }
 }
 
 pub fn worker_deliver_post(payload_json: &str, data: Option<&[u8]>) {
@@ -338,12 +425,47 @@ impl SymEngine {
 /// Keep signature parity with QuickJS for js_queue drain.
 pub fn worker_tick(_timeout: Duration) {}
 
+fn with_engine<R>(f: impl FnOnce(&mut SymEngine) -> R) -> Option<R> {
+    let slot = ENGINE_SLOT.lock().clone()?;
+    // Eval holds this mutex. Nested Interceptor dispatch must not deadlock.
+    let mut eng = slot.try_lock()?;
+    Some(f(&mut eng))
+}
+
 pub fn worker_interceptor_enter(hook_id: u32, regs: [u64; 8]) -> [u64; 8] {
-    let _ = hook_id;
-    regs
+    let Some(mut out) = with_engine(|eng| {
+        let src = format!(
+            "(function(){{ var regs=[{},{},{},{},{},{},{},{}]; if (typeof __goauld_on_enter==='function') __goauld_on_enter({hook_id}, regs); var m=globalThis.__goauld_mut_x||{{}}; return JSON.stringify([+(m[0]||0),+(m[1]||0),+(m[2]||0),+(m[3]||0),+(m[4]||0),+(m[5]||0),+(m[6]||0),+(m[7]||0)]); }})()",
+            regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7]
+        );
+        eng.eval_string_result(&src).ok()
+    }) else {
+        return regs;
+    };
+    let Some(s) = out.take() else {
+        return regs;
+    };
+    let Ok(v) = serde_json::from_str::<Vec<f64>>(&s) else {
+        return regs;
+    };
+    let mut next = regs;
+    for (i, n) in v.into_iter().take(8).enumerate() {
+        next[i] = n as u64;
+    }
+    next
 }
 
 pub fn worker_interceptor_leave(hook_id: u32, retval: u64) -> u64 {
-    let _ = hook_id;
-    retval
+    let Some(s) = with_engine(|eng| {
+        let src = format!(
+            "(function(){{ if (typeof __goauld_on_leave==='function') __goauld_on_leave({hook_id}, {retval}); var v=globalThis.__goauld_mut_retval; return (v==null)? '{retval}' : String(+v); }})()"
+        );
+        eng.eval_string_result(&src).ok()
+    }) else {
+        return retval;
+    };
+    let Some(s) = s else {
+        return retval;
+    };
+    s.trim().parse::<f64>().map(|n| n as u64).unwrap_or(retval)
 }

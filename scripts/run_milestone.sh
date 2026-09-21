@@ -7,7 +7,7 @@ DIST="${ROOT}/dist/android-arm64"
 HOST="${ROOT}/target/release/goauld"
 export PATH="${ANDROID_HOME:-$HOME/Library/Android/sdk}/platform-tools:$PATH"
 
-usage() { echo "usage: $0 <unit|1|2|3|4|5|6|apk|e2e|device-smoke|all>"; exit 1; }
+usage() { echo "usage: $0 <unit|1|2|3|4|5|6|apk|e2e|device-smoke|symbiote|all>"; exit 1; }
 [[ -n "$MS" ]] || usage
 
 need_device() {
@@ -267,6 +267,10 @@ case "$MS" in
   4) milestone_4 ;;
   5) milestone_5 ;;
   6|apk|e2e) milestone_6 ;;
+  symbiote)
+    echo "== symbiote: emulator inject + Script.runtime =="
+    "$ROOT/scripts/test-symbiote-emulator.sh"
+    ;;
   all)
     milestone_unit
     milestone_2

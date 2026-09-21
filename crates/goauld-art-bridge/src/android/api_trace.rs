@@ -739,7 +739,32 @@ fn try_java_string_contents(compressed: u32) -> Option<String> {
         Some(String::from_utf16_lossy(u16s))
     }
 }
+/// Frame-pump classes. They match `android.` but are not the API a script just called
+/// (a toast still shows up as `android.widget.Toast`).
+const NOISE_API_PREFIXES: &[&str] = &[
+    "android.view.DisplayEventReceiver",
+    "android.view.Choreographer",
+    "android.view.ViewRootImpl",
+    "android.view.ThreadedRenderer",
+    "android.view.SurfaceControl",
+    "android.view.InsetsController",
+    "android.view.SyncRtSurfaceTransactionApplier",
+    "android.graphics.HardwareRenderer",
+    "android.animation.AnimationHandler",
+];
+
+fn is_noisy_api_class(class_dotted: &str) -> bool {
+    NOISE_API_PREFIXES.iter().any(|p| {
+        class_dotted == *p
+            || class_dotted.starts_with(&format!("{p}$"))
+            || class_dotted.starts_with(&format!("{p}."))
+    })
+}
+
 fn class_matches_filter(class_dotted: &str) -> bool {
+    if is_noisy_api_class(class_dotted) {
+        return false;
+    }
     let prefixes = PREFIXES.read();
     if prefixes.is_empty() {
         return true;

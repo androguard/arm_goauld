@@ -990,25 +990,27 @@ var Java = {
 function __goauld_java_invoke(key, x) {
   if (globalThis.__goauldJavaInvoking) return { did: false };
   globalThis.__goauldJavaInvoking = true;
+  var out = { did: false };
   try {
     var fn = __javaImpls[key];
-    if (!fn) return { did: false };
-    var methodName = key.split('.').pop();
-    var self = {};
-    self[methodName] = function (v) {
-      if (typeof globalThis.__goauldCallOriginalOverride === 'function') {
-        return globalThis.__goauldCallOriginalOverride(key, +v);
-      }
-      return __goauld.javaCallOriginal(key, +v);
-    };
-    var ret = fn.call(self, x);
-    return { did: true, ret: +ret };
+    if (fn) {
+      var methodName = key.split('.').pop();
+      var self = {};
+      self[methodName] = function (v) {
+        if (typeof globalThis.__goauldCallOriginalOverride === 'function') {
+          return globalThis.__goauldCallOriginalOverride(key, +v);
+        }
+        return __goauld.javaCallOriginal(key, +v);
+      };
+      var ret = fn.call(self, x);
+      out = { did: true, ret: +ret };
+    }
   } catch (e) {
     send('java-invoke-err:' + e);
-    return { did: false };
-  } finally {
-    globalThis.__goauldJavaInvoking = false;
+    out = { did: false };
   }
+  globalThis.__goauldJavaInvoking = false;
+  return out;
 }
 
 

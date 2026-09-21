@@ -292,19 +292,49 @@ pub fn dispatch(op: &str, args_json: &str) -> String {
             let want_leave = arg_b(&args, 1);
             let replace_mode = arg_b(&args, 2);
             let code = unsafe { std::slice::from_raw_parts(addr as *const u8, 16) }.to_vec();
+            let id_cell = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+            let id_enter = id_cell.clone();
+            let id_leave = id_cell.clone();
+            let on_leave = if want_leave || replace_mode {
+                Some(Box::new(move |cpu: &mut CpuContext, retval: u64| {
+                    let id = *id_leave.lock().unwrap_or_else(|e| e.into_inner());
+                    let out = crate::js_queue::submit_interceptor_leave(
+                        id,
+                        retval,
+                        Duration::from_secs(5),
+                    );
+                    cpu.x[0] = out;
+                }) as _)
+            } else {
+                None
+            };
             let cbs = HookCallbacks {
-                on_enter: Some(Box::new(|_cpu: &mut CpuContext| {})),
-                on_leave: if want_leave {
-                    Some(Box::new(|_cpu: &mut CpuContext, _ret: u64| {}))
-                } else {
-                    None
-                },
+                on_enter: Some(Box::new(move |cpu: &mut CpuContext| {
+                    let id = *id_enter.lock().unwrap_or_else(|e| e.into_inner());
+                    let regs = [
+                        cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3], cpu.x[4], cpu.x[5], cpu.x[6],
+                        cpu.x[7],
+                    ];
+                    let out = crate::js_queue::submit_interceptor_enter(
+                        id,
+                        regs,
+                        Duration::from_secs(5),
+                    );
+                    for i in 0..8 {
+                        cpu.x[i] = out[i];
+                    }
+                })),
+                on_leave,
                 save_simd: false,
                 replace_mode,
             };
-            // Full Interceptor JS dispatch is QuickJS-first; Symbiote gets native attach.
             match attach(addr, &code, cbs) {
-                Ok(h) => ok_n(h.id as f64),
+                Ok(h) => {
+                    if let Ok(mut g) = id_cell.lock() {
+                        *g = h.id;
+                    }
+                    ok_n(h.id as f64)
+                }
                 Err(e) => {
                     log::error!("Interceptor.attach failed: {e}");
                     ok_n(0.0)
@@ -535,26 +565,178 @@ pub fn dispatch(op: &str, args_json: &str) -> String {
         "exceptionProbeJson" => ok_u(),
         "scheduleOnThread" => ok_b(false),
         "spawnSleepThread" => ok_u(),
-        "javaEnsureVm" => ok_b(true),
+        "javaEnsureVm" => ok_b(
+            goauld_art_bridge::android_sdk_int_or_0() != 0
+                || goauld_art_bridge::android_version().is_ok(),
+        ),
         "javaIsMainThread" => ok_b(goauld_art_bridge::is_main_thread().unwrap_or(false)),
-        "javaAndroidVersion" => ok_n(0.0),
-        "javaNextMainToken" => ok_n(0.0),
-        "javaScheduleMain" => ok_b(false),
-        "javaEnumerateClassesJson" => ok_s("[]"),
-        "javaEnumerateLoadersJson" => ok_s("[]"),
-        "javaClassMethodsJson" => ok_s("[]"),
-        "javaClassFieldsJson" => ok_s("[]"),
-        "javaReadStaticFieldJson" => ok_u(),
-        "javaDumpStorageJson" => ok_s("{}"),
-        "javaHook" => ok_b(false),
-        "javaCallOriginal" => ok_n(arg_f(&args, 1)),
-        "androidToast" => ok_b(false),
-        "traceAndroidApi" => ok_b(false),
+        "javaAndroidVersion" => ok_s(
+            goauld_art_bridge::android_version().unwrap_or_else(|_| "unknown".into()),
+        ),
+        "javaNextMainToken" => ok_n(goauld_art_bridge::next_main_token() as f64),
+        "javaScheduleMain" => {
+            let token = arg_u(&args, 0);
+            match goauld_art_bridge::schedule_on_main(token) {
+                Ok(()) => ok_b(true),
+                Err(e) => {
+                    log::debug!("javaScheduleMain({token}): {e}");
+                    ok_b(false)
+                }
+            }
+        }
+        "javaEnumerateClassesJson" => ok_s(match goauld_art_bridge::enumerate_loaded_classes() {
+            Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "[]".into()),
+            Err(e) => {
+                log::warn!("enumerateLoadedClasses: {e}");
+                "[]".into()
+            }
+        }),
+        "javaEnumerateLoadersJson" => ok_s(match goauld_art_bridge::enumerate_class_loaders() {
+            Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "[]".into()),
+            Err(e) => {
+                log::warn!("enumerateClassLoaders: {e}");
+                "[]".into()
+            }
+        }),
+        "javaClassMethodsJson" => ok_s(class_methods_json(&arg_s(&args, 0))),
+        "javaClassFieldsJson" => ok_s(class_fields_json(&arg_s(&args, 0))),
+        "javaReadStaticFieldJson" => {
+            let class_name = arg_s(&args, 0);
+            let field = arg_s(&args, 1);
+            ok_s(
+                match goauld_art_bridge::read_static_field_json(&class_name, &field) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("read static {class_name}.{field}: {e}");
+                        serde_json::json!({ "error": e.to_string() }).to_string()
+                    }
+                },
+            )
+        }
+        "javaDumpStorageJson" => ok_s(match goauld_art_bridge::dump_app_storage_json() {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("dumpAppStorage: {e}");
+                serde_json::json!({ "error": e.to_string() }).to_string()
+            }
+        }),
+        "javaHook" => {
+            let class_name = arg_s(&args, 0);
+            let method = arg_s(&args, 1);
+            let sig = args
+                .get(2)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("(I)I");
+            log::info!("Java hook requested: {class_name}.{method}{sig}");
+            match goauld_art_bridge::hook_java_method(&class_name, &method, sig) {
+                Ok(()) => ok_b(true),
+                Err(e) => {
+                    log::error!("hook_java_method failed: {e}");
+                    ok_b(false)
+                }
+            }
+        }
+        "javaCallOriginal" => {
+            let key = arg_s(&args, 0);
+            let x = arg_f(&args, 1);
+            ok_n(
+                goauld_art_bridge::js_call_original(&key, x as i32).unwrap_or(x as i32) as f64,
+            )
+        }
+        "androidToast" => {
+            let message = arg_s(&args, 0);
+            match goauld_art_bridge::show_android_toast(&message) {
+                Ok(()) => ok_b(true),
+                Err(e) => {
+                    log::error!("androidToast failed: {e}");
+                    ok_b(false)
+                }
+            }
+        }
+        "stopAndroidApiTrace" => {
+            goauld_art_bridge::stop_android_api_trace();
+            ok_b(true)
+        }
+        "traceAndroidApi" => {
+            let raw = arg_s(&args, 0);
+            let prefixes: Vec<String> = if raw.trim().is_empty() {
+                goauld_art_bridge::DEFAULT_API_PREFIXES
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            } else {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+            let max_events = arg_f(&args, 1) as u64;
+            match goauld_art_bridge::start_android_api_trace(
+                goauld_art_bridge::AndroidApiTraceConfig {
+                    prefixes,
+                    max_events,
+                    with_signature: true,
+                },
+            ) {
+                Ok(id) => ok_n(id as f64),
+                Err(e) => {
+                    log::error!("traceAndroidApi failed: {e}");
+                    ok_n(0.0)
+                }
+            }
+        }
         "sendJson" | "sendJsonData" => {
             // Handled specially by Symbiote install (needs bridge).
             err("sendJson must be bound by engine")
         }
         other => err(format!("unknown host op: {other}")),
+    }
+}
+
+fn class_methods_json(class_name: &str) -> String {
+    match goauld_art_bridge::enumerate_class_methods(class_name) {
+        Ok(v) => {
+            let arr: Vec<_> = v
+                .into_iter()
+                .map(|m| {
+                    json!({
+                        "name": m.name,
+                        "sig": m.sig,
+                        "isStatic": m.is_static,
+                        "flags": m.flags,
+                    })
+                })
+                .collect();
+            serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
+        }
+        Err(e) => {
+            log::warn!("class methods {class_name}: {e}");
+            "[]".into()
+        }
+    }
+}
+
+fn class_fields_json(class_name: &str) -> String {
+    match goauld_art_bridge::enumerate_class_fields(class_name) {
+        Ok(v) => {
+            let arr: Vec<_> = v
+                .into_iter()
+                .map(|f| {
+                    json!({
+                        "name": f.name,
+                        "type": f.type_name,
+                        "isStatic": f.is_static,
+                        "flags": f.flags,
+                    })
+                })
+                .collect();
+            serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
+        }
+        Err(e) => {
+            log::warn!("class fields {class_name}: {e}");
+            "[]".into()
+        }
     }
 }
 

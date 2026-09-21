@@ -126,60 +126,361 @@ mod device {
     /// PTRACE_SEIZE / INTERRUPT / options — values match Linux uapi (bionic too).
     const PTRACE_SEIZE: i32 = 0x4206;
     const PTRACE_INTERRUPT: i32 = 0x4207;
-    const PTRACE_O_EXITKILL: i32 = 0x0010_0000;
-    const PTRACE_O_TRACEEXIT: i32 = 0x0000_0040;
+    // Not PTRACE_O_EXITKILL: a host timeout or a later inject that stops a
+    // leftover tracer would SIGKILL the app. Detach-on-tracer-exit is enough.
     const __WALL: i32 = 0x4000_0000;
 
-    pub(super) fn seize(pid: i32) -> Result<Tracee, TraceeError> {
-        let tids = list_tids(pid)?;
-        eprintln!("goauld-inject: seize pid={pid} tids={tids:?}");
-        for &tid in &tids {
-            // Prefer SEIZE; fall back to ATTACH on older/odd kernels.
+    /// uid 0 is not enough to ptrace an app. SELinux (`shell` cannot ptrace
+    /// `untrusted_app`), Yama `ptrace_scope`, a missing `CAP_SYS_PTRACE`, or an
+    /// existing tracer all return EPERM. Log which one it is, then relax the
+    /// ones root can actually change.
+    fn prepare_ptrace(pid: i32) -> Result<(), TraceeError> {
+        let hint = ptrace_context(pid);
+        eprintln!("goauld-inject: {hint}");
+        if let Some(tracer) = tracer_pid(pid) {
+            if tracer > 0 {
+                release_stale_tracer(pid, tracer)?;
+            }
+        }
+        relax_yama();
+        ensure_cap_sys_ptrace();
+        Ok(())
+    }
+
+    fn ptrace_context(pid: i32) -> String {
+        let self_ctx = read_proc_attr("/proc/self/attr/current");
+        let tgt_ctx = read_proc_attr(&format!("/proc/{pid}/attr/current"));
+        let tracer = tracer_pid(pid)
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "?".into());
+        let yama = read_proc_attr("/proc/sys/kernel/yama/ptrace_scope");
+        let enforce = read_proc_attr("/sys/fs/selinux/enforce");
+        let caps = cap_eff();
+        format!(
+            "ptrace context self={self_ctx} target={tgt_ctx} TracerPid={tracer} yama={} enforce={} CapEff={caps:#x} cap_sys_ptrace={}",
+            if yama.is_empty() { "?".into() } else { yama },
+            if enforce.is_empty() { "off".into() } else { enforce },
+            caps & (1 << 19) != 0
+        )
+    }
+
+    fn read_proc_attr(path: &str) -> String {
+        fs::read(path)
+            .map(|b| {
+                String::from_utf8_lossy(&b)
+                    .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+                    .to_string()
+            })
+            .unwrap_or_default()
+    }
+
+    fn proc_cmdline(pid: i32) -> String {
+        fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|b| {
+                String::from_utf8_lossy(&b)
+                    .replace('\0', " ")
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A previous injector that is still alive keeps `TracerPid` set. Magisk `su`
+    /// often survives the host `timeout`, so that process can sit there forever.
+    /// Stop it and continue when the app is still alive. `PTRACE_O_EXITKILL` on
+    /// older injectors SIGKILLs the app when the tracer dies — say so.
+    fn release_stale_tracer(target: i32, tracer: i32) -> Result<(), TraceeError> {
+        if tracer <= 1 || tracer == std::process::id() as i32 {
+            return Err(TraceeError::Ptrace(format!(
+                "pid {target} is already traced by pid {tracer}"
+            )));
+        }
+        let cmd = proc_cmdline(tracer);
+        let comm = read_proc_attr(&format!("/proc/{tracer}/comm"));
+        let ours = cmd.contains("goauld-injector") || comm.starts_with("goauld-inject");
+        if !ours {
+            let shown = if cmd.is_empty() { comm } else { cmd };
+            return Err(TraceeError::Ptrace(format!(
+                "pid {target} is already traced by pid {tracer} ({shown}) — detach that debugger first"
+            )));
+        }
+        eprintln!(
+            "goauld-inject: leftover injector pid={tracer} is still tracing pid={target} ({cmd}); stopping it"
+        );
+        let rc = unsafe { libc::kill(tracer, libc::SIGKILL) };
+        if rc != 0 {
+            return Err(TraceeError::Ptrace(format!(
+                "pid {target} is traced by leftover injector {tracer}; kill failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if fs::metadata(format!("/proc/{target}")).is_err() {
+                return Err(TraceeError::Ptrace(format!(
+                    "leftover injector pid {tracer} was still attached; stopping it also stopped pid {target}. Relaunch the app and inject again"
+                )));
+            }
+            match tracer_pid(target) {
+                Some(0) | None => {
+                    eprintln!("goauld-inject: pid {target} is no longer traced");
+                    return Ok(());
+                }
+                Some(next) if next != tracer => {
+                    return Err(TraceeError::Ptrace(format!(
+                        "pid {target} is now traced by pid {next}"
+                    )));
+                }
+                _ if std::time::Instant::now() >= deadline => {
+                    return Err(TraceeError::Ptrace(format!(
+                        "leftover injector pid {tracer} did not detach from pid {target}"
+                    )));
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+    }
+
+    fn tracer_pid(pid: i32) -> Option<i32> {
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("TracerPid:") {
+                return rest.trim().parse().ok();
+            }
+        }
+        None
+    }
+
+    fn cap_eff() -> u64 {
+        let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("CapEff:") {
+                return u64::from_str_radix(rest.trim(), 16).unwrap_or(0);
+            }
+        }
+        0
+    }
+
+    fn selinux_type(ctx: &str) -> &str {
+        ctx.split(':').nth(2).unwrap_or("")
+    }
+
+    fn relax_yama() {
+        let path = "/proc/sys/kernel/yama/ptrace_scope";
+        let cur = read_proc_attr(path);
+        if cur.is_empty() || cur == "0" {
+            return;
+        }
+        match fs::write(path, b"0") {
+            Ok(()) => eprintln!("goauld-inject: set yama ptrace_scope=0 (was {cur})"),
+            Err(e) => eprintln!("goauld-inject: could not set ptrace_scope ({e})"),
+        }
+    }
+
+    fn ensure_cap_sys_ptrace() {
+        const CAP_SYS_PTRACE: u64 = 1 << 19;
+        if cap_eff() & CAP_SYS_PTRACE != 0 {
+            return;
+        }
+        eprintln!("goauld-inject: CAP_SYS_PTRACE missing; trying capset");
+        #[repr(C)]
+        struct CapHdr {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        struct CapData {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        let hdr = CapHdr {
+            version: 0x2008_0522,
+            pid: 0,
+        };
+        let data = [
+            CapData {
+                effective: u32::MAX,
+                permitted: u32::MAX,
+                inheritable: u32::MAX,
+            },
+            CapData {
+                effective: 0x3ff,
+                permitted: 0x3ff,
+                inheritable: 0x3ff,
+            },
+        ];
+        let rc = unsafe { libc::syscall(libc::SYS_capset, &hdr as *const CapHdr, data.as_ptr()) };
+        if rc != 0 {
+            eprintln!(
+                "goauld-inject: capset failed ({})",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            eprintln!("goauld-inject: capset ok CapEff={:#x}", cap_eff());
+        }
+    }
+
+    /// Shell-domain root can write app files and still be denied `process ptrace`.
+    /// Move into the Magisk/su domain when that is allowed, and add a live allow.
+    fn relax_selinux_ptrace(pid: i32) -> bool {
+        let self_ctx = read_proc_attr("/proc/self/attr/current");
+        let tgt_ctx = read_proc_attr(&format!("/proc/{pid}/attr/current"));
+        let self_ty = selinux_type(&self_ctx);
+        let tgt_ty = selinux_type(&tgt_ctx);
+        eprintln!(
+            "goauld-inject: ptrace denied ({self_ty} -> {tgt_ty}); relaxing SELinux"
+        );
+        let mut changed = false;
+        if self_ty == "shell" || self_ty.is_empty() {
+            for ctx in ["u:r:magisk:s0", "u:r:su:s0"] {
+                if try_setcon(ctx) {
+                    eprintln!("goauld-inject: setcon {ctx}");
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if !tgt_ty.is_empty() {
+            let now = read_proc_attr("/proc/self/attr/current");
+            let from = selinux_type(&now);
+            let source = if from.is_empty() { self_ty } else { from };
+            if !source.is_empty() && allow_ptrace_policy(source, tgt_ty) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn try_setcon(ctx: &str) -> bool {
+        let mut bytes = ctx.as_bytes().to_vec();
+        bytes.push(0);
+        fs::OpenOptions::new()
+            .write(true)
+            .open("/proc/self/attr/current")
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(&bytes)
+            })
+            .is_ok()
+    }
+
+    fn allow_ptrace_policy(source: &str, target: &str) -> bool {
+        let rule = format!("allow {source} {target} process ptrace");
+        let bins = [
+            "magiskpolicy",
+            "/data/adb/magisk/magiskpolicy",
+            "/debug_ramdisk/magiskpolicy",
+            "supolicy",
+        ];
+        for bin in bins {
+            let out = std::process::Command::new(bin)
+                .args(["--live", &rule])
+                .output();
+            match out {
+                Ok(out) if out.status.success() => {
+                    eprintln!("goauld-inject: {bin} --live '{rule}'");
+                    return true;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("goauld-inject: {bin} ({e})"),
+            }
+        }
+        let applets = ["/debug_ramdisk/magisk", "magisk", "/sbin/magisk"];
+        for bin in applets {
+            let out = std::process::Command::new(bin)
+                .args(["magiskpolicy", "--live", &rule])
+                .output();
+            match out {
+                Ok(out) if out.status.success() => {
+                    eprintln!("goauld-inject: {bin} magiskpolicy --live '{rule}'");
+                    return true;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("goauld-inject: {bin} ({e})"),
+            }
+        }
+        eprintln!("goauld-inject: magiskpolicy not available for '{rule}'");
+        false
+    }
+
+    fn stop_tid(tid: i32) -> Result<(), TraceeError> {
+        // Prefer SEIZE; fall back to ATTACH on older/odd kernels.
+        let seized = unsafe {
+            libc::ptrace(
+                PTRACE_SEIZE,
+                tid,
+                ptr::null_mut::<libc::c_void>(),
+                ptr::null_mut::<libc::c_void>(),
+            )
+        };
+        if seized != 0 {
+            let seize_err = std::io::Error::last_os_error();
+            eprintln!("goauld-inject: SEIZE tid={tid} failed ({seize_err}); trying ATTACH");
             let rc = unsafe {
                 libc::ptrace(
-                    PTRACE_SEIZE,
+                    libc::PTRACE_ATTACH,
                     tid,
                     ptr::null_mut::<libc::c_void>(),
-                    (PTRACE_O_TRACEEXIT | PTRACE_O_EXITKILL) as usize as *mut libc::c_void,
+                    ptr::null_mut::<libc::c_void>(),
                 )
             };
             if rc != 0 {
-                eprintln!(
-                    "goauld-inject: SEIZE tid={tid} failed ({}); trying ATTACH",
+                return Err(TraceeError::Ptrace(format!(
+                    "ATTACH tid={tid}: {}",
                     std::io::Error::last_os_error()
-                );
-                let rc = unsafe {
-                    libc::ptrace(
-                        libc::PTRACE_ATTACH,
-                        tid,
-                        ptr::null_mut::<libc::c_void>(),
-                        ptr::null_mut::<libc::c_void>(),
-                    )
-                };
-                if rc != 0 {
-                    return Err(TraceeError::Ptrace(format!(
-                        "ATTACH tid={tid}: {}",
-                        std::io::Error::last_os_error()
-                    )));
-                }
-            } else {
-                let rc = unsafe {
-                    libc::ptrace(
-                        PTRACE_INTERRUPT,
-                        tid,
-                        ptr::null_mut::<libc::c_void>(),
-                        ptr::null_mut::<libc::c_void>(),
-                    )
-                };
-                if rc != 0 {
-                    return Err(TraceeError::Ptrace(format!(
-                        "INTERRUPT tid={tid}: {}",
-                        std::io::Error::last_os_error()
-                    )));
-                }
+                )));
             }
-            wait_stop(tid)?;
-            eprintln!("goauld-inject: tid={tid} stopped");
+        } else {
+            let rc = unsafe {
+                libc::ptrace(
+                    PTRACE_INTERRUPT,
+                    tid,
+                    ptr::null_mut::<libc::c_void>(),
+                    ptr::null_mut::<libc::c_void>(),
+                )
+            };
+            if rc != 0 {
+                return Err(TraceeError::Ptrace(format!(
+                    "INTERRUPT tid={tid}: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        wait_stop(tid)?;
+        eprintln!("goauld-inject: tid={tid} stopped");
+        Ok(())
+    }
+
+    fn is_eperm(err: &TraceeError) -> bool {
+        let msg = err.to_string();
+        msg.contains("Operation not permitted") || msg.contains("os error 1")
+    }
+
+    pub(super) fn seize(pid: i32) -> Result<Tracee, TraceeError> {
+        prepare_ptrace(pid)?;
+        let tids = list_tids(pid)?;
+        eprintln!("goauld-inject: seize pid={pid} tids={tids:?}");
+        let mut relaxed = false;
+        for &tid in &tids {
+            if let Err(err) = stop_tid(tid) {
+                if !relaxed && is_eperm(&err) {
+                    relaxed = true;
+                    if relax_selinux_ptrace(pid) {
+                        match stop_tid(tid) {
+                            Ok(()) => continue,
+                            Err(retry) => {
+                                eprintln!("goauld-inject: {}", ptrace_context(pid));
+                                return Err(retry);
+                            }
+                        }
+                    }
+                    eprintln!("goauld-inject: {}", ptrace_context(pid));
+                }
+                return Err(err);
+            }
         }
         let mut regs: libc::user_regs_struct = unsafe { mem::zeroed() };
         getregs(pid, &mut regs)?;
@@ -219,13 +520,17 @@ mod device {
         func_addr: u64,
         args: &[u64],
     ) -> Result<u64, TraceeError> {
-        // Prefer an executable BRK gadget; fall back to caller-provided via
-        // remote_call_with_lr once the injector has an RX scratch page.
-        let lr = find_brk_gadget(tracee.pid)
-            .or_else(|_| Err(TraceeError::Msg(
-                "no brk gadget — use remote_call_with_lr after planting one".into(),
-            )))?;
-        remote_call_with_lr(tracee, func_addr, args, lr)
+        // The linker's caller check uses LR. It must point at an executable
+        // mapping of a real library (libc), not an anonymous stub.
+        if let Ok(lr) = find_brk_gadget(tracee.pid) {
+            eprintln!("goauld-inject: using brk gadget @{lr:#x}");
+            return remote_call_with_lr(tracee, func_addr, args, lr, None);
+        }
+        let planted = plant_brk_in_libc(tracee)?;
+        eprintln!("goauld-inject: planted brk @{:#x} in libc", planted.addr);
+        let ret = remote_call_with_lr(tracee, func_addr, args, planted.addr, None);
+        drop(planted);
+        ret
     }
 
     pub fn remote_call_stub(
@@ -266,6 +571,7 @@ mod device {
         func_addr: u64,
         args: &[u64],
         lr: u64,
+        stack: Option<u64>,
     ) -> Result<u64, TraceeError> {
         let tid = tracee.pid;
         let mut regs: libc::user_regs_struct = unsafe { mem::zeroed() };
@@ -277,10 +583,16 @@ mod device {
         }
 
         eprintln!(
-            "goauld-inject: remote_call func={func_addr:#x} lr={lr:#x} args={args:?}"
+            "goauld-inject: remote_call func={func_addr:#x} lr={lr:#x} sp={stack:?} args={args:?}"
         );
         regs.regs[30] = lr;
         regs.pc = func_addr;
+        if let Some(sp) = stack {
+            // Own stack so dlopen cannot smash the stopped thread's frame
+            // (signal stack, or a shell blocked in wait).
+            regs.sp = sp;
+            regs.regs[29] = 0;
+        }
         setregs(tid, &regs)?;
         let ret = match cont_until_pc(tid, lr) {
             Ok(v) => v,
@@ -416,6 +728,72 @@ mod device {
         Ok(ret)
     }
 
+    /// `openat(AT_FDCWD, path, O_RDONLY)` inside the target. Returns the raw x0
+    /// (fd >= 0, or -errno). Does **not** close a successful fd.
+    pub fn remote_openat(tracee: &Tracee, path_addr: u64) -> Result<i64, TraceeError> {
+        remote_syscall(
+            tracee,
+            56,
+            &[(-100i64) as u64, path_addr, 0, 0],
+            "openat",
+        )
+    }
+
+    pub fn remote_close(tracee: &Tracee, fd: u64) -> Result<i64, TraceeError> {
+        remote_syscall(tracee, 57, &[fd], "close")
+    }
+
+    /// `memfd_create(name, MFD_CLOEXEC)` — name is a remote cstr address.
+    pub fn remote_memfd_create(tracee: &Tracee, name_addr: u64) -> Result<i64, TraceeError> {
+        // nr 279 on aarch64; MFD_CLOEXEC = 1
+        remote_syscall(tracee, 279, &[name_addr, 1], "memfd_create")
+    }
+
+    pub fn remote_write(
+        tracee: &Tracee,
+        fd: u64,
+        buf_addr: u64,
+        len: u64,
+    ) -> Result<i64, TraceeError> {
+        remote_syscall(tracee, 64, &[fd, buf_addr, len], "write")
+    }
+
+    /// `lseek(fd, offset, whence)` inside the target.
+    pub fn remote_lseek(
+        tracee: &Tracee,
+        fd: u64,
+        offset: u64,
+        whence: u64,
+    ) -> Result<i64, TraceeError> {
+        remote_syscall(tracee, 62, &[fd, offset, whence], "lseek")
+    }
+
+    fn remote_syscall(
+        tracee: &Tracee,
+        nr: u64,
+        args: &[u64],
+        label: &str,
+    ) -> Result<i64, TraceeError> {
+        let tid = tracee.pid;
+        let mut regs: libc::user_regs_struct = unsafe { mem::zeroed() };
+        getregs(tid, &mut regs)?;
+        let backup = regs;
+        let svc_addr = find_svc_gadget(tid)?;
+        regs.regs[8] = nr;
+        for (i, a) in args.iter().enumerate().take(6) {
+            regs.regs[i] = *a;
+        }
+        regs.pc = svc_addr;
+        setregs(tid, &regs)?;
+        syscall_step(tid)?;
+        syscall_step(tid)?;
+        getregs(tid, &mut regs)?;
+        let ret = regs.regs[0] as i64;
+        eprintln!("goauld-inject: {label} returned {ret}");
+        setregs(tid, &backup)?;
+        Ok(ret)
+    }
+
     fn syscall_step(tid: i32) -> Result<(), TraceeError> {
         let rc = unsafe {
             libc::ptrace(
@@ -434,10 +812,108 @@ mod device {
         wait_stop(tid)
     }
 
-    /// Scan executable mappings for a `brk #0` instruction (LR landing pad).
+    /// Scan executable libc/libdl/linker text for any `brk #imm` (LR landing pad).
     fn find_brk_gadget(pid: i32) -> Result<u64, TraceeError> {
-        const BRK0: [u8; 4] = [0x00, 0x00, 0x20, 0xD4]; // brk #0
-        scan_exec_gadget(pid, &BRK0, "brk #0")
+        let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
+            .map_err(|e| TraceeError::Msg(e.to_string()))?;
+        for line in maps.lines() {
+            if !(line.contains("r-xp") || line.contains("r-x")) {
+                continue;
+            }
+            if !(line.contains("libc.so") || line.contains("libdl.so") || line.contains("/linker"))
+            {
+                continue;
+            }
+            let range = line.split_whitespace().next().unwrap_or("");
+            let mut segs = range.split('-');
+            let start = u64::from_str_radix(segs.next().unwrap_or("0"), 16).unwrap_or(0);
+            let end = u64::from_str_radix(segs.next().unwrap_or("0"), 16).unwrap_or(0);
+            if end <= start {
+                continue;
+            }
+            let len = (end - start).min(0x20_0000) as usize;
+            let buf = read_memory(pid, start, len)?;
+            for i in (0..buf.len().saturating_sub(4)).step_by(4) {
+                let word = u32::from_le_bytes(buf[i..i + 4].try_into().unwrap_or([0; 4]));
+                // BRK: 11010100 001i iiii iiii iii0 0000
+                if word & 0xFFE0_001F == 0xD420_0000 {
+                    return Ok(start + i as u64);
+                }
+            }
+        }
+        Err(TraceeError::Msg("brk gadget not found".into()))
+    }
+
+    /// Temporarily replace the last instruction of libc's text with `brk #0`.
+    /// Restored on drop. mprotect RW→write→RX flushes the I-cache on arm64.
+    fn plant_brk_in_libc(tracee: &Tracee) -> Result<PlantedBrk<'_>, TraceeError> {
+        let maps = fs::read_to_string(format!("/proc/{}/maps", tracee.pid))
+            .map_err(|e| TraceeError::Msg(e.to_string()))?;
+        let mut best: Option<(u64, u64)> = None;
+        for line in maps.lines() {
+            if !(line.contains("r-xp") || line.contains("r-x")) || !line.contains("libc.so") {
+                continue;
+            }
+            let range = line.split_whitespace().next().unwrap_or("");
+            let mut segs = range.split('-');
+            let start = u64::from_str_radix(segs.next().unwrap_or("0"), 16).unwrap_or(0);
+            let end = u64::from_str_radix(segs.next().unwrap_or("0"), 16).unwrap_or(0);
+            if end > start + 4 {
+                best = Some((start, end));
+            }
+        }
+        let (_start, end) = best.ok_or_else(|| TraceeError::Msg("libc exec mapping not found".into()))?;
+        let addr = (end - 4) & !3;
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0x1000) as u64;
+        let page = addr & !(page_size - 1);
+        const PROT_RW: u64 = 1 | 2;
+        const PROT_RX: u64 = 1 | 4;
+
+        let saved = read_memory(tracee.pid, addr, 4)?;
+        let mut saved4 = [0u8; 4];
+        saved4.copy_from_slice(&saved[..4]);
+
+        let mp = remote_mprotect_svc(tracee, page, page_size, PROT_RW)?;
+        if mp != 0 {
+            return Err(TraceeError::Msg(format!(
+                "mprotect RW libc @{page:#x} failed: {mp:#x}"
+            )));
+        }
+        write_memory(tracee.pid, addr, &0xD420_0000u32.to_le_bytes())?;
+        let mp = remote_mprotect_svc(tracee, page, page_size, PROT_RX)?;
+        if mp != 0 {
+            let _ = remote_mprotect_svc(tracee, page, page_size, PROT_RW);
+            let _ = write_memory(tracee.pid, addr, &saved4);
+            let _ = remote_mprotect_svc(tracee, page, page_size, PROT_RX);
+            return Err(TraceeError::Msg(format!(
+                "mprotect RX libc @{page:#x} failed: {mp:#x}"
+            )));
+        }
+        Ok(PlantedBrk {
+            tracee,
+            page,
+            page_len: page_size,
+            addr,
+            saved: saved4,
+        })
+    }
+
+    struct PlantedBrk<'a> {
+        tracee: &'a Tracee,
+        page: u64,
+        page_len: u64,
+        addr: u64,
+        saved: [u8; 4],
+    }
+
+    impl Drop for PlantedBrk<'_> {
+        fn drop(&mut self) {
+            const PROT_RW: u64 = 1 | 2;
+            const PROT_RX: u64 = 1 | 4;
+            let _ = remote_mprotect_svc(self.tracee, self.page, self.page_len, PROT_RW);
+            let _ = write_memory(self.tracee.pid, self.addr, &self.saved);
+            let _ = remote_mprotect_svc(self.tracee, self.page, self.page_len, PROT_RX);
+        }
     }
 
     fn scan_exec_gadget(pid: i32, needle: &[u8; 4], label: &str) -> Result<u64, TraceeError> {
@@ -699,6 +1175,7 @@ mod device {
     target_arch = "aarch64"
 ))]
 pub use device::{
-    read_memory, remote_call_stub, remote_call_with_lr, remote_mmap_svc, remote_mprotect_svc,
+    read_memory, remote_call_stub, remote_call_with_lr, remote_close, remote_lseek,
+    remote_memfd_create, remote_mmap_svc, remote_mprotect_svc, remote_openat, remote_write,
     write_memory,
 };

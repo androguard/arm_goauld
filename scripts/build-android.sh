@@ -20,6 +20,8 @@ Usage: $0 [quickjs|symbiote]
 Build arm64 Android injector + agent.
   quickjs   (default) rquickjs / full Frida surface
   symbiote  pure-Rust engine (path dep ../../symbiote)
+
+Artifacts land in dist/android-arm64 unless GOAULD_ANDROID_DIST is set.
 EOF
     exit 0
     ;;
@@ -47,7 +49,10 @@ CLANG="${PREBUILT}/bin/aarch64-linux-android${API}-clang"
 AR="${PREBUILT}/bin/llvm-ar"
 [[ -x "$CLANG" ]] || { echo "missing clang: $CLANG" >&2; exit 1; }
 
-OUT="${ROOT}/dist/android-arm64"
+SYSROOT="${PREBUILT}/sysroot"
+export BINDGEN_EXTRA_CLANG_ARGS="--sysroot=${SYSROOT} -I${SYSROOT}/usr/include -target aarch64-linux-android${API}"
+
+OUT="${GOAULD_ANDROID_DIST:-${ROOT}/dist/android-arm64}"
 mkdir -p "$OUT"
 
 export ANDROID_NDK_HOME

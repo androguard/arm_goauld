@@ -24,7 +24,7 @@ struct Cli {
     cmd: Option<Cmd>,
 
     // ---- legacy flat flags (inject) kept for scripts ----
-    #[arg(long, conflicts_with = "package")]
+    #[arg(long)]
     pid: Option<i32>,
     #[arg(long)]
     package: Option<String>,
@@ -44,7 +44,7 @@ enum Cmd {
     Ps,
     /// Ptrace-inject `libgoauld_agent.so` into a target.
     Inject {
-        #[arg(long, conflicts_with = "package")]
+        #[arg(long)]
         pid: Option<i32>,
         #[arg(long)]
         package: Option<String>,
@@ -166,7 +166,7 @@ fn cmd_inject(
         let pkg = package
             .as_deref()
             .context("--stage-into-app needs a package")?;
-        library_path = stage_so_into_app(pkg, &so)?;
+        library_path = stage_so_into_app(pid, pkg, &so)?;
         eprintln!("staged agent to {library_path}");
     }
 
@@ -222,62 +222,258 @@ fn cmd_trace_syscalls(
 }
 
 fn resolve_target(pid: Option<i32>, package: Option<&str>) -> Result<(i32, Option<String>)> {
+    if let Some(pid) = pid {
+        let cmd = read_cmdline(pid);
+        if cmd.is_empty() {
+            if let Some(pkg) = package {
+                eprintln!("goauld-inject: pid {pid} is not running; looking up {pkg}");
+                let info = find_by_package(pkg)
+                    .with_context(|| format!("pid {pid} is not running and {pkg} has no app process"))?;
+                eprintln!(
+                    "goauld-inject: using live pid={} for {pkg}",
+                    info.pid
+                );
+                return Ok((info.pid as i32, Some(pkg.to_string())));
+            }
+            bail!("pid {pid} is not running");
+        }
+        if let Some(pkg) = package {
+            let first = cmd.split_whitespace().next().unwrap_or("");
+            if first != pkg && !first.starts_with(&format!("{pkg}:")) {
+                bail!(
+                    "pid {pid} is not {pkg} (cmdline: {}). Refusing to inject into a shell that only mentions the package.",
+                    clip(&cmd)
+                );
+            }
+        }
+        let package = package.map(|s| s.to_string()).or_else(|| {
+            enumerate_processes().ok().and_then(|list| {
+                list.into_iter()
+                    .find(|p| p.pid as i32 == pid)
+                    .and_then(|p| p.package)
+            })
+        });
+        eprintln!("goauld-inject: using pid={pid} cmd={}", clip(&cmd));
+        return Ok((pid, package));
+    }
     if let Some(pkg) = package {
         let info = find_by_package(pkg).with_context(|| format!("package not running: {pkg}"))?;
         return Ok((info.pid as i32, Some(pkg.to_string())));
     }
-    let pid = pid.context("pass --pid or --package")?;
-    let package = enumerate_processes().ok().and_then(|list| {
-        list.into_iter()
-            .find(|p| p.pid as i32 == pid)
-            .and_then(|p| p.package)
-    });
-    Ok((pid, package))
+    bail!("pass --pid or --package")
 }
 
-fn stage_so_into_app(package: &str, so: &std::path::Path) -> Result<String> {
+fn read_cmdline(pid: i32) -> String {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    raw.split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn clip(cmd: &str) -> String {
+    let mut s: String = cmd.chars().take(140).collect();
+    if cmd.chars().count() > 140 {
+        s.push('…');
+    }
+    s
+}
+
+fn stage_so_into_app(pid: i32, package: &str, so: &std::path::Path) -> Result<String> {
     let dest_name = so
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("libgoauld_agent.so");
-    let files_dir = format!("/data/data/{package}/files");
-    let dest = format!("{files_dir}/{dest_name}");
-
-    let _ = Command::new("mkdir").args(["-p", &files_dir]).status();
-
-    let root_cp = Command::new("cp")
-        .args([so.to_str().unwrap(), &dest])
-        .status();
-    if let Ok(st) = root_cp {
-        if st.success() {
-            let _ = Command::new("chmod").args(["755", &dest]).status();
-            if let Ok(out) = Command::new("stat")
-                .args(["-c", "%u:%g", &files_dir])
-                .output()
-            {
-                let ug = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !ug.is_empty() {
-                    let _ = Command::new("chown").args([&ug, &dest]).status();
-                }
-            }
-            return Ok(dest);
-        }
+    let uid = {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    let user = uid / 100_000;
+    let euid = effective_uid();
+    eprintln!("goauld-inject: staging as euid={euid} into app uid={uid} user={user}");
+    if euid != 0 {
+        bail!(
+            "not root (euid={euid}) — refuse to stage into the app mount namespace; \
+             Magisk must grant su to the adb shell"
+        );
     }
 
+    // The app has its own mount namespace. A copy into the root namespace's
+    // /data/data/<pkg> is invisible to dlopen ("library not found").
+    let pkg_dirs = [
+        format!("/data/user/{user}/{package}"),
+        format!("/data/user_de/{user}/{package}"),
+        format!("/data/data/{package}"),
+    ];
+    let pkg_dir = pkg_dirs
+        .iter()
+        .find(|dir| std::path::Path::new(&proc_root(pid, dir)).is_dir())
+        .cloned()
+        .unwrap_or_else(|| format!("/data/data/{package}"));
+    let files_dir = format!("{pkg_dir}/files");
+    let visible = format!("{files_dir}/{dest_name}");
+    let host_dir = proc_root(pid, &files_dir);
+    let host_file = proc_root(pid, &visible);
+    let so_s = so.to_str().context("agent path")?;
+
+    let mut last_err = String::new();
+
+    // 1) Write through /proc/<pid>/root (same files the process sees).
+    if stage_copy_into(&host_dir, &host_file, so_s, &proc_root(pid, &pkg_dir)) {
+        return Ok(visible);
+    }
+    last_err = format!("/proc/{pid}/root copy failed");
+
+    // 2) Enter the app mount namespace and copy there.
+    if stage_nsenter(pid, &files_dir, &visible, so_s, &pkg_dir) {
+        return Ok(visible);
+    }
+    last_err = format!("{last_err}; nsenter copy failed");
+
+    // 3) Last resort: run-as (debuggable apps only).
     let _ = Command::new("run-as")
         .args([package, "mkdir", "-p", "files"])
         .status();
     let status = Command::new("run-as")
-        .args([
-            package,
-            "cp",
-            so.to_str().unwrap(),
-            &format!("files/{dest_name}"),
-        ])
-        .status()
-        .with_context(|| format!("run-as {package} cp failed"))?;
-    if !status.success() {
-        bail!("could not stage {so:?} into {dest} (tried root cp and run-as)");
+        .args([package, "cp", so_s, &format!("files/{dest_name}")])
+        .status();
+    if status.map(|s| s.success()).unwrap_or(false) {
+        eprintln!("staged agent via run-as: {visible}");
+        return Ok(visible);
     }
-    Ok(dest)
+
+    bail!("could not stage {so:?} into {visible} ({last_err})")
+}
+
+fn stage_copy_into(host_dir: &str, host_file: &str, so: &str, pkg_host: &str) -> bool {
+    let mk = Command::new("mkdir").args(["-p", host_dir]).status();
+    if !mk.map(|s| s.success()).unwrap_or(false) {
+        eprintln!("goauld-inject: mkdir {host_dir} failed");
+        return false;
+    }
+    let cp = Command::new("cp").args([so, host_file]).status();
+    if !cp.map(|s| s.success()).unwrap_or(false) {
+        eprintln!("goauld-inject: cp → {host_file} failed");
+        return false;
+    }
+    let _ = Command::new("chmod").args(["755", host_file]).status();
+    if let Ok(out) = Command::new("stat").args(["-c", "%u:%g", pkg_host]).output() {
+        let ug = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if ug.contains(':') {
+            let _ = Command::new("chown").args([&ug, host_file]).status();
+        }
+    }
+    let _ = Command::new("chcon")
+        .args(["u:object_r:app_data_file:s0", host_file])
+        .status();
+    let _ = Command::new("restorecon").args([host_file]).status();
+    // Toybox chcon has no --reference. Copy the real MLS context (categories)
+    // from the directory or a sibling, or the app still gets EACCES.
+    if let Some(ctx) = selinux_context_of(pkg_host).or_else(|| selinux_context_of(host_dir)) {
+        if Command::new("chcon")
+            .args([&ctx, host_file])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            eprintln!("goauld-inject: chcon {ctx}");
+        }
+    }
+    match std::fs::metadata(host_file) {
+        Ok(meta) => {
+            eprintln!("staged agent in app namespace: {host_file} ({} bytes)", meta.len());
+            true
+        }
+        Err(e) => {
+            eprintln!("staged path not visible via {host_file}: {e}");
+            false
+        }
+    }
+}
+
+fn stage_nsenter(pid: i32, files_dir: &str, visible: &str, so: &str, pkg_dir: &str) -> bool {
+    let mk = Command::new("nsenter")
+        .args([
+            "-t",
+            &pid.to_string(),
+            "-m",
+            "--",
+            "mkdir",
+            "-p",
+            files_dir,
+        ])
+        .status();
+    if !mk.map(|s| s.success()).unwrap_or(false) {
+        eprintln!("goauld-inject: nsenter mkdir failed");
+        return false;
+    }
+    let cp = Command::new("nsenter")
+        .args(["-t", &pid.to_string(), "-m", "--", "cp", so, visible])
+        .status();
+    if !cp.map(|s| s.success()).unwrap_or(false) {
+        eprintln!("goauld-inject: nsenter cp failed");
+        return false;
+    }
+    let _ = Command::new("nsenter")
+        .args(["-t", &pid.to_string(), "-m", "--", "chmod", "755", visible])
+        .status();
+    if let Ok(out) = Command::new("nsenter")
+        .args(["-t", &pid.to_string(), "-m", "--", "stat", "-c", "%u:%g", pkg_dir])
+        .output()
+    {
+        let ug = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if ug.contains(':') {
+            let _ = Command::new("nsenter")
+                .args(["-t", &pid.to_string(), "-m", "--", "chown", &ug, visible])
+                .status();
+        }
+    }
+    let _ = Command::new("nsenter")
+        .args([
+            "-t",
+            &pid.to_string(),
+            "-m",
+            "--",
+            "chcon",
+            "u:object_r:app_data_file:s0",
+            visible,
+        ])
+        .status();
+    eprintln!("staged agent via nsenter: {visible}");
+    true
+}
+
+fn selinux_context_of(path: &str) -> Option<String> {
+    let out = Command::new("ls").args(["-Zd", path]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .find(|t| t.starts_with("u:") && t.contains(":object_r:"))
+        .map(|s| s.to_string())
+}
+
+fn effective_uid() -> u32 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for line in status.lines() {
+        let Some(rest) = line.strip_prefix("Uid:") else {
+            continue;
+        };
+        // Uid: real effective saved fs
+        if let Some(euid) = rest.split_whitespace().nth(1).and_then(|s| s.parse().ok()) {
+            return euid;
+        }
+        if let Some(ruid) = rest.split_whitespace().next().and_then(|s| s.parse().ok()) {
+            return ruid;
+        }
+    }
+    0
+}
+
+fn proc_root(pid: i32, abs: &str) -> String {
+    format!("/proc/{pid}/root{abs}")
 }

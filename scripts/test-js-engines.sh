@@ -15,9 +15,12 @@ run_engine() {
   case "$eng" in
     quickjs)
       cargo test -p goauld-script --features quickjs --lib js_engine_ -- --test-threads=1
+      cargo test -p goauld-agent --features quickjs --lib agent_host_attach -- --test-threads=1
       ;;
     symbiote)
       cargo test -p goauld-script --no-default-features --features symbiote --lib js_engine_ \
+        -- --test-threads=1
+      cargo test -p goauld-agent --no-default-features --features symbiote --lib agent_host_attach \
         -- --test-threads=1
       ;;
     *)
@@ -34,7 +37,8 @@ case "$TARGET" in
     cat <<EOF
 Usage: $0 [both|quickjs|symbiote]
 
-Runs shared host smoke tests (`js_engine_*`: send + Process/Memory/timers/Script.runtime)
+Runs shared host smoke tests (`js_engine_*`) and a host-style agent attach
+(`agent_host_attach_roundtrip`: Hello + ScriptLoad + `Interceptor.attach`)
 against each JS engine feature set.
 EOF
     exit 0

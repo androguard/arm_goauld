@@ -81,6 +81,12 @@ unsafe impl Sync for QuickJsEngine {}
 impl QuickJsEngine {
     pub fn new(bridge: Arc<HostBridge>) -> Result<Self, String> {
         let runtime = Runtime::new().map_err(|e| format!("Runtime::new: {e}"))?;
+        // Frida's QuickJS agent tends to win on bursty alloc/string workloads when GC
+        // kicks in mid-loop. Raise the threshold so short scripts aren't taxed by
+        // cyclic GC; memory_limit 0 = unlimited (QuickJS still refcounts).
+        runtime.set_memory_limit(0);
+        runtime.set_gc_threshold(64 * 1024 * 1024);
+        runtime.set_max_stack_size(1024 * 1024);
         let context = Context::full(&runtime).map_err(|e| format!("Context::full: {e}"))?;
         let eng = Self {
             _runtime: runtime,
@@ -1112,6 +1118,16 @@ impl QuickJsEngine {
 
             helpers
                 .set(
+                    "stopAndroidApiTrace",
+                    Func::from(|| -> bool {
+                        goauld_art_bridge::stop_android_api_trace();
+                        true
+                    }),
+                )
+                .map_err(|e| e.to_string())?;
+
+            helpers
+                .set(
                     "traceAndroidApi",
                     Func::from(
                         |filter: Opt<String>, max_events: Opt<f64>| -> f64 {
@@ -1371,6 +1387,18 @@ impl QuickJsEngine {
 
             ctx.globals()
                 .set("__goauld", helpers)
+                .map_err(|e| e.to_string())?;
+
+            // Explicit GC for bursty alloc/string scripts (Frida often starts those
+            // microbenches on a cleaner heap; without this, prior ScriptLoad residue
+            // and cyclic prelude graphs tax QuickJS mid-loop).
+            ctx.globals()
+                .set(
+                    "gc",
+                    Func::from(|ctx: Ctx<'_>| {
+                        ctx.run_gc();
+                    }),
+                )
                 .map_err(|e| e.to_string())?;
 
             ctx.eval::<(), _>(PRELUDE)

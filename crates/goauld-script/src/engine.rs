@@ -127,7 +127,7 @@ fn try_parse_send_hi(source: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "quickjs")]
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
     use crate::js_queue;
     use std::sync::mpsc::channel;
     use std::sync::Mutex;
@@ -135,7 +135,7 @@ mod tests {
 
     static TEST_GATE: Mutex<()> = Mutex::new(());
 
-    #[cfg(feature = "quickjs")]
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
     fn drain_payloads(
         rx: &std::sync::mpsc::Receiver<Message>,
         wait: Duration,
@@ -170,15 +170,14 @@ mod tests {
     }
 
     /// Shared QJS worker — clear per-test overrides / impls so cases stay isolated.
-    #[cfg(feature = "quickjs")]
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
     fn reset_java_test_state(eng: &ScriptEngine) {
         eng.load(
             99,
             r#"
             globalThis.__goauldCallOriginalOverride = undefined;
-            if (typeof __javaImpls === 'object') {
-              for (var k in __javaImpls) { delete __javaImpls[k]; }
-            }
+            globalThis.__goauldJavaInvoking = false;
+            if (typeof __javaImpls === 'object') __javaImpls = {};
             "#
             .into(),
         )
@@ -441,6 +440,228 @@ mod tests {
         );
     }
 
+    /// `Interceptor.attach` must install a hook id on both engines (host builds
+    /// record the hook without patching the target; the id is still required).
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
+    #[test]
+    fn js_engine_interceptor_attach() {
+        let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = channel();
+        let eng = ScriptEngine::new();
+        eng.set_outbound(tx);
+        let expect = expected_runtime();
+        eng.load(
+            8,
+            r#"
+            (function() {
+              try {
+                var page = Memory.alloc(32);
+                for (var i = 0; i < 8; i++) Memory.writeU32(page.add(i * 4), 0xD503201F);
+                var listener = Interceptor.attach(page, {
+                  onEnter: function() {},
+                  onLeave: function() {}
+                });
+                if (!listener || typeof listener.detach !== 'function') {
+                  throw new Error('no listener');
+                }
+                listener.detach();
+                send({ type: 'interceptor-attach', runtime: Script.runtime, ok: true });
+                send('interceptor-attach-ok');
+              } catch (e) {
+                var msg = (e && e.message != null) ? String(e.message) : String(e);
+                send({ type: 'interceptor-attach-err', err: msg });
+              }
+            })();
+            "#
+            .into(),
+        )
+        .unwrap_or_else(|e| panic!("js_engine_interceptor_attach ({expect}): {e}"));
+        let payloads = drain_payloads_until(&rx, Duration::from_secs(3), Some("interceptor-attach-ok"));
+        if let Some(err) = payloads.iter().find(|p| p.contains("interceptor-attach-err")) {
+            panic!("script error for {expect}: {err}; payloads={payloads:?}");
+        }
+        assert!(
+            payloads.iter().any(|p| p.contains("interceptor-attach-ok")),
+            "missing ok for {expect}; payloads={payloads:?}"
+        );
+    }
+
+    /// `scripts/fixtures/java_toast.js` must run on both engines.
+    /// Host builds cannot show a real Toast, so the bridge is stubbed; the
+    /// device path uses `android.widget.Toast` via `show_android_toast`.
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
+    #[test]
+    fn js_engine_java_toast_fixture() {
+        let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = channel();
+        let eng = ScriptEngine::new();
+        eng.set_outbound(tx);
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/fixtures/java_toast.js"
+        ))
+        .expect("read java_toast.js");
+        let source = format!(
+            r#"
+            __goauld.androidToast = function (msg) {{
+              send('toast-msg:' + msg);
+              return true;
+            }};
+            __goauld.javaScheduleMain = function () {{ return false; }};
+            {fixture}
+            "#
+        );
+        eng.load(9, source)
+            .unwrap_or_else(|e| panic!("java_toast.js: {e}"));
+        let payloads = drain_payloads_until(&rx, Duration::from_secs(3), Some("toast-shown"));
+        assert!(
+            payloads.iter().any(|p| p.contains("toast-shown")),
+            "payloads={payloads:?}"
+        );
+        assert!(
+            payloads
+                .iter()
+                .any(|p| p.contains("Hello from goauld (android.widget.Toast)")),
+            "toast text missing; payloads={payloads:?}"
+        );
+    }
+
+    /// `inspect_package.js` must parse and filter the same way on both engines.
+    /// Host JNI is stubbed so the assertions are about the script, not the device.
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
+    #[test]
+    fn js_engine_inspect_package_fixture() {
+        let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = channel();
+        let eng = ScriptEngine::new();
+        eng.set_outbound(tx);
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/fixtures/inspect_package.js"
+        ))
+        .expect("read inspect_package.js");
+        let source = format!(
+            r#"
+            __goauld.javaEnsureVm = function () {{ return true; }};
+            __goauld.javaAndroidVersion = function () {{ return "14"; }};
+            __goauld.javaDumpStorageJson = function () {{
+              return JSON.stringify({{
+                package: "com.example.javatarget",
+                dataDir: "/data/data/com.example.javatarget",
+                sharedPrefs: {{ "app.xml": {{ token: "t" }} }},
+                dataDirListing: ["files"],
+                filesSnippets: {{}}
+              }});
+            }};
+            __goauld.javaEnumerateClassesJson = function () {{
+              return JSON.stringify([
+                "android.app.Activity",
+                "java.lang.String",
+                "com.example.javatarget.Target",
+                "com.example.javatarget.Other"
+              ]);
+            }};
+            __goauld.javaClassMethodsJson = function (name) {{
+              return JSON.stringify([{{ name: "hookMe", sig: "(I)I", isStatic: false, flags: 1 }}]);
+            }};
+            __goauld.javaClassFieldsJson = function () {{
+              return JSON.stringify([{{ name: "COUNT", type: "int", isStatic: true, flags: 8 }}]);
+            }};
+            __goauld.javaReadStaticFieldJson = function () {{ return "42"; }};
+            {fixture}
+            "#
+        );
+        eng.load(21, source)
+            .unwrap_or_else(|e| panic!("inspect_package.js: {e}"));
+        let payloads = drain_payloads_until(&rx, Duration::from_secs(3), Some("inspect-ok"));
+        let joined = payloads.join("\n");
+        assert!(
+            joined.contains("inspect-ok"),
+            "missing inspect-ok; payloads={payloads:?}"
+        );
+        assert!(
+            joined.contains("com.example.javatarget"),
+            "package missing; payloads={payloads:?}"
+        );
+        assert!(
+            joined.contains("\"androidVersion\":\"14\"") || joined.contains("\"androidVersion\": \"14\""),
+            "androidVersion getter did not run; payloads={payloads:?}"
+        );
+        assert!(
+            !joined.contains("android.app.Activity"),
+            "framework class leaked into the dump; payloads={payloads:?}"
+        );
+        assert!(
+            joined.contains("hookMe") && joined.contains("COUNT") && joined.contains("42"),
+            "method/field/static dump missing; payloads={payloads:?}"
+        );
+        assert!(
+            joined.contains("\"classesMatched\":2") || joined.contains("\"classesMatched\": 2"),
+            "expected 2 app classes; payloads={payloads:?}"
+        );
+    }
+
+    /// Proxy `Java.use`, `implementation` setters, `toString(radix)`, `arguments`,
+    /// and pointer stringification. Same script on both engines.
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
+    #[test]
+    fn js_engine_symbiote_parity_surface() {
+        let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = channel();
+        let eng = ScriptEngine::new();
+        eng.set_outbound(tx);
+        eng.load(
+            22,
+            r#"
+            __goauld.javaEnsureVm = function () { return true; };
+            __goauld.javaClassMethodsJson = function () {
+              return JSON.stringify([{ name: "hookMe", sig: "(I)I", isStatic: false, flags: 1 }]);
+            };
+            var hooked = "";
+            __goauld.javaHook = function (cls, name, sig) {
+              hooked = cls + "." + name + sig;
+              return true;
+            };
+            Java.perform(function () {
+              var T = Java.use("com.example.javatarget.Target");
+              T.hookMe.implementation = function (x) { return x + 1; };
+            });
+            function f(a) { return arguments[1] + arguments.length; }
+            send({
+              hooked: hooked,
+              hex: (255).toString(16),
+              ptr: "" + ptr(66),
+              args: f(1, 2),
+              prim: +({ valueOf: function () { return 7; } })
+            });
+            "#
+            .into(),
+        )
+        .unwrap_or_else(|e| panic!("parity surface: {e}"));
+        let payloads = drain_payloads_until(&rx, Duration::from_secs(3), Some("hookMe"));
+        let joined = payloads.join("\n");
+        assert!(
+            joined.contains("com.example.javatarget.Target.hookMe(I)I"),
+            "implementation setter did not call javaHook; payloads={payloads:?}"
+        );
+        assert!(
+            joined.contains("\"hex\":\"ff\"") || joined.contains("\"hex\": \"ff\""),
+            "toString(16); payloads={payloads:?}"
+        );
+        assert!(
+            joined.contains("0x42"),
+            "pointer toString; payloads={payloads:?}"
+        );
+        assert!(
+            joined.contains("\"args\":4") || joined.contains("\"args\": 4"),
+            "arguments; payloads={payloads:?}"
+        );
+        assert!(
+            joined.contains("\"prim\":7") || joined.contains("\"prim\": 7"),
+            "valueOf; payloads={payloads:?}"
+        );
+    }
+
     #[cfg(feature = "quickjs")]
     #[test]
     fn process_memory_apis_smoke() {
@@ -481,7 +702,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "quickjs")]
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
     #[test]
     fn java_use_implementation_eval_ok() {
         let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -512,7 +733,7 @@ mod tests {
     }
 
     /// No registered implementation → worker falls back to arg+1000.
-    #[cfg(feature = "quickjs")]
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
     #[test]
     fn java_invoke_missing_impl_falls_back() {
         let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -532,7 +753,7 @@ mod tests {
     }
 
     /// Replacement without callOriginal: return x+1000 and send.
-    #[cfg(feature = "quickjs")]
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
     #[test]
     fn java_invoke_simple_replacement() {
         let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -570,7 +791,7 @@ mod tests {
     }
 
     /// Frida-shaped `this.hookMe(x)` via override (orig = x*2).
-    #[cfg(feature = "quickjs")]
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
     #[test]
     fn java_invoke_call_original_via_this() {
         let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -609,7 +830,7 @@ mod tests {
     }
 
     /// Matches scripts/fixtures/java_hook.js shape (device e2e).
-    #[cfg(feature = "quickjs")]
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
     #[test]
     fn java_invoke_fixture_shape_with_mocked_original() {
         let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -642,7 +863,7 @@ mod tests {
     }
 
     /// Thrown implementation → error send + fallback arg+1000.
-    #[cfg(feature = "quickjs")]
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
     #[test]
     fn java_invoke_impl_throw_sends_error() {
         let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -681,7 +902,7 @@ mod tests {
     }
 
     /// Host stub: javaCallOriginal outside a live ART hook returns the arg unchanged.
-    #[cfg(feature = "quickjs")]
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
     #[test]
     fn java_call_original_host_stub_value() {
         let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -704,7 +925,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "quickjs")]
+    #[cfg(any(feature = "quickjs", feature = "symbiote"))]
     #[test]
     fn java_invoke_sequential_calls_stable() {
         let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());

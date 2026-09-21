@@ -75,7 +75,7 @@ try {
   wx.putTstRegImm(Register.x0, 0xff);
   wx.putXpaciReg(Register.x0);
   var signed = wx.sign(0x1000);
-  results.extras = wx.offset > 0 && (+signed === 0x1000);
+  results.extras = wx.offset > 0 && signed.address === 0x1000 && (+signed) === 0x1000;
   wx.flush();
 
   try {
